@@ -150,14 +150,33 @@ def find_t32_binary(arch: str, t32sys: str | os.PathLike | None = None) -> Path:
 
 # --- free port ---------------------------------------------------------------
 
+_PORT_PICK_LOCK = threading.Lock()
+_PORT_RECENTLY_PICKED: set[int] = set()
+
+
 def pick_free_port() -> int:
-    """Bind, ask the kernel for an ephemeral port, release. The port may race
-    with another process if many spawns happen at once; for typical use this
-    is fine.
+    """Pick an ephemeral port the kernel says is free.
+
+    Race-aware: when many spawns happen back-to-back the kernel can hand the
+    same ephemeral port to two callers before either has bound TRACE32 on it.
+    We keep an in-process set of recently-picked ports to avoid handing the
+    same port to the next caller within the same process — full immunity also
+    needs the spawn loop to retry on bind failure, which it does.
     """
-    with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as s:
-        s.bind(("127.0.0.1", 0))
-        return int(s.getsockname()[1])
+    with _PORT_PICK_LOCK:
+        for _ in range(50):
+            with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as s:
+                s.bind(("127.0.0.1", 0))
+                p = int(s.getsockname()[1])
+            if p not in _PORT_RECENTLY_PICKED:
+                _PORT_RECENTLY_PICKED.add(p)
+                # Cap the set so it doesn't grow unbounded.
+                if len(_PORT_RECENTLY_PICKED) > 256:
+                    _PORT_RECENTLY_PICKED.clear()
+                    _PORT_RECENTLY_PICKED.add(p)
+                return p
+        # Couldn't find one in 50 tries — let the caller bind anyway.
+        return p
 
 
 def is_port_open(host: str, port: int, timeout: float = 0.3) -> bool:

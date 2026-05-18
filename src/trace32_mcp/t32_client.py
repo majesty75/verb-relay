@@ -313,7 +313,10 @@ class T32Client:
         """
         import tempfile, time as _time
         from pathlib import Path as _P
-        tmp = _P(tempfile.gettempdir()) / f"trace32_mcp_area_{area}.txt"
+        # Per-endpoint filename so concurrent reads across instances don't
+        # clobber each other on the host filesystem (the T32-side AREA is
+        # already per-instance, but the dump file we read back is on us).
+        tmp = _P(tempfile.gettempdir()) / f"trace32_mcp_area_{self.endpoint.port}_{area}.txt"
         try:
             tmp.unlink()
         except FileNotFoundError:
@@ -569,7 +572,10 @@ class T32Client:
         import time as _time
         from pathlib import Path as _P
 
-        tmp = _P(tempfile.gettempdir()) / f"trace32_mcp_area_{area}.txt"
+        # Per-endpoint filename so concurrent reads across instances don't
+        # clobber each other on the host filesystem (the T32-side AREA is
+        # already per-instance, but the dump file we read back is on us).
+        tmp = _P(tempfile.gettempdir()) / f"trace32_mcp_area_{self.endpoint.port}_{area}.txt"
         try:
             tmp.unlink()
         except FileNotFoundError:
