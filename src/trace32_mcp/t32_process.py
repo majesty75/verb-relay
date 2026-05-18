@@ -127,11 +127,58 @@ def pick_free_port() -> int:
 
 
 def is_port_open(host: str, port: int, timeout: float = 0.3) -> bool:
-    """Whether something is listening on host:port (TCP)."""
+    """Whether something is listening on host:port (TCP).
+
+    WARNING: TRACE32's `RCL=NETASSIST` opens a UDP port, NOT a TCP one. This
+    check will FALSE NEGATIVE for a working T32 RCL endpoint. Use
+    `is_rcl_responsive()` for spawn/attach readiness checks.
+    """
     try:
         with closing(socket.create_connection((host, port), timeout=timeout)):
             return True
     except OSError:
+        return False
+
+
+def is_rcl_responsive(host: str, port: int, t32sys: str | None = None,
+                      timeout_per_try: float = 1.0) -> bool:
+    """Probe a TRACE32 RCL endpoint by performing the real handshake.
+
+    `RCL=NETASSIST` is UDP; you can't tell it's up with a TCP connect. The
+    only reliable readiness check is to send the actual RCL protocol bytes
+    (T32_Init + T32_Attach) and see if T32 answers.
+
+    Returns True iff the handshake round-trips. Eats every exception so the
+    spawn wait-loop can call this safely while T32 is still starting up.
+    """
+    try:
+        from .t32_bridge import load_t32api
+        api = load_t32api(t32sys)
+    except Exception:
+        return False
+    try:
+        api.T32_Config(b"NODE=", host.encode())
+        api.T32_Config(b"PORT=", str(port).encode())
+        api.T32_Config(b"PACKLEN=", b"1024")
+        if api.T32_Init() != 0:
+            return False
+        # T32_DEV_ICD = 1
+        if api.T32_Attach(1) != 0:
+            try:
+                api.T32_Exit()
+            except Exception:
+                pass
+            return False
+        try:
+            api.T32_Exit()
+        except Exception:
+            pass
+        return True
+    except Exception:
+        try:
+            api.T32_Exit()
+        except Exception:
+            pass
         return False
 
 
@@ -143,24 +190,25 @@ OS=
 ID=T32_{node}
 TMP={tmp_path}
 
-PBI=
-SIM
+PBI=SIM
 
 RCL=NETASSIST
-PORT={port}
 PACKLEN={packlen}
+PORT={port}
 
 SCREEN=
 HEADER=Trace32-MCP {node}
 """
-# Notes on the canonical config.t32 layout above:
-#   * Each section is `KEY=` on its own line followed by section content on the
-#     NEXT line. Some sections (RCL, SCREEN) take the value on the same line,
-#     but PBI / OS / SCREEN historically use the next-line form across versions.
-#   * `PBI=` then `SIM` enables the instruction-set simulator backend. Writing
-#     `PBI=SIM` on a single line silently produces a no-backend launch on some
-#     TRACE32 builds — the GUI opens but RCL is never armed.
-#   * Sections are separated by blank lines.
+# Layout notes (verified against TRACE32 docs via the bundled manuals search):
+#   * Each section starts with `KEY=` and ends at the next blank line.
+#   * `PBI=SIM` on a single line enables the instruction-set simulator backend.
+#     Both single-line `PBI=SIM` and multi-line `PBI=\nSIM` forms are valid;
+#     int_codeblock.pdf p7 and app_python.pdf p9 both show the single-line form
+#     in working production configs.
+#   * `RCL=NETASSIST` opens a Remote API *UDP* port (per installation.pdf p51).
+#     PORT and PACKLEN must be inside the RCL section (separated by blank
+#     lines from neighbouring sections). PACKLEN should precede PORT per
+#     the codeblock and app_python examples.
 
 
 def write_config_t32(
@@ -445,7 +493,8 @@ def spawn(
         popen_kwargs["start_new_session"] = True  # POSIX: detach from our session
     proc = subprocess.Popen(argv, **popen_kwargs)
 
-    # Wait for the RCL port
+    # Wait for the RCL port. NOTE: RCL=NETASSIST is UDP — we must probe with the
+    # actual RCL handshake, not a TCP connect (which would always false-negative).
     deadline = time.time() + timeout_seconds
     while time.time() < deadline:
         if proc.poll() is not None:
@@ -454,9 +503,11 @@ def spawn(
                 f"TRACE32 binary exited early (rc={proc.returncode}). "
                 f"Log tail:\n{Path(log_path).read_text(errors='replace')[-2000:]}"
             )
-        if is_port_open("127.0.0.1", chosen_port, timeout=0.3):
+        # Real RCL handshake (UDP) — TCP probe would always false-negative here.
+        if is_rcl_responsive("127.0.0.1", chosen_port, t32sys=str(binary.parent.parent.parent),
+                             timeout_per_try=0.5):
             break
-        time.sleep(0.2)
+        time.sleep(0.3)
     else:
         _terminate(proc.pid)
         log_fh.close()
@@ -477,15 +528,18 @@ def spawn(
             f"--- generated config.t32 ({config_path}) ---\n{cfg_text}\n"
             f"--- TRACE32 stdout/stderr tail ({log_path}) ---\n{log_tail}\n"
             f"--- diagnostic checklist ---\n"
-            f"  * The GUI opening but RCL not binding usually means TRACE32 read\n"
-            f"    the config but rejected the PBI/RCL section. Verify the layout\n"
-            f"    matches Lauterbach's standard form (PBI= on its own line, value\n"
-            f"    on the next line).\n"
-            f"  * Some CPUs need an explicit CPU= line under the SYSTEM section.\n"
+            f"  * RCL=NETASSIST opens a UDP port (not TCP). Readiness probe\n"
+            f"    uses the real T32_Init+T32_Attach handshake; if it fails\n"
+            f"    that means either T32 isn't listening or the t32api wrapper\n"
+            f"    can't reach the configured port.\n"
+            f"  * Windows Defender Firewall can silently block UDP bind on a\n"
+            f"    new port the first time PowerView runs. Allow inbound UDP\n"
+            f"    on the TRACE32 executable for the chosen port.\n"
+            f"  * Some CPUs need an explicit `SYStem.CPU <name>` line.\n"
             f"    Pass `extra_config` to t32_spawn to inject it.\n"
-            f"  * On Windows, Defender Firewall can silently block bind on a new\n"
-            f"    port the first time PowerView runs. Allow inbound on the\n"
-            f"    TRACE32 executable and retry.\n"
+            f"  * Run t32_render_config first to dry-run the config that would\n"
+            f"    be written, and compare against the working configs in\n"
+            f"    int_codeblock.pdf p7 / app_python.pdf p9 (use t32_search_manuals).\n"
         )
 
     log_fh.close()
@@ -532,8 +586,13 @@ def attach(
         _REGISTRY.register(inst)
         return inst
 
-    if not is_port_open(host, port, timeout=0.5):
-        raise ConnectionError(f"nothing listening on {host}:{port}")
+    # Use the real RCL handshake — RCL=NETASSIST is UDP and would silently
+    # fail any TCP-based probe.
+    if not is_rcl_responsive(host, port, timeout_per_try=1.5):
+        raise ConnectionError(
+            f"RCL not responding at {host}:{port}. Either nothing is listening "
+            "or the T32 there isn't configured with `RCL=NETASSIST PORT={port}`."
+        )
     node = node_name or f"T32_external_{host}_{port}"
     existing = _REGISTRY.get_by_endpoint(host, port)
     if existing:

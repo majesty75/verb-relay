@@ -11,7 +11,7 @@ import time
 from pydantic import Field
 
 from ..session import get_client
-from ..t32_process import is_port_open, registry
+from ..t32_process import is_port_open, is_rcl_responsive, registry
 from ._common import TargetSelector
 
 
@@ -51,20 +51,37 @@ def t32_healthcheck(args: dict) -> dict:
 
     checks: list[dict] = []
 
-    # 1. TCP reachability
+    # 1. RCL handshake (UDP) — the authoritative readiness signal for
+    # RCL=NETASSIST endpoints. A pure TCP probe would always fail here.
     t0 = time.perf_counter()
-    tcp_ok = is_port_open(inst.host, inst.port, timeout=1.0)
+    rcl_ok = is_rcl_responsive(inst.host, inst.port, t32sys=getattr(inst, "t32sys", None),
+                               timeout_per_try=1.5)
+    checks.append({
+        "name": "rcl_handshake",
+        "ok": rcl_ok,
+        "latency_ms": _ms(t0),
+        "detail": f"T32_Init+T32_Attach round-trip to {inst.host}:{inst.port}",
+    })
+
+    # 2. Side-channel TCP probe — informational only. A T32 running with
+    # `RCL=NETASSIST` will NOT have this port open over TCP, so a False here
+    # is expected. A True can hint there's something else (e.g. NETTCP)
+    # bound to the port.
+    t0 = time.perf_counter()
+    tcp_ok = is_port_open(inst.host, inst.port, timeout=0.5)
     checks.append({
         "name": "tcp_port_open",
         "ok": tcp_ok,
+        "informational": True,  # excluded from `overall` verdict
         "latency_ms": _ms(t0),
-        "detail": f"{inst.host}:{inst.port}",
+        "detail": "informational — RCL=NETASSIST is UDP so False is expected",
     })
-    if not tcp_ok:
-        return {"ok": False, "instance": inst.to_dict(), "checks": checks,
-                "error": f"nothing listening at {inst.host}:{inst.port}"}
 
-    # 2. RCL handshake (Init + Attach happens lazily on first command)
+    if not rcl_ok:
+        return {"ok": False, "instance": inst.to_dict(), "checks": checks,
+                "error": f"RCL not responding at {inst.host}:{inst.port}"}
+
+    # 3. Client setup
     try:
         client = get_client(host=inst.host, port=inst.port, node_name=inst.node_name)
     except Exception as e:
@@ -116,10 +133,13 @@ def t32_healthcheck(args: dict) -> dict:
     except Exception as e:
         checks.append({"name": "area_log_readable", "ok": False, "latency_ms": _ms(t0), "error": str(e)})
 
-    overall = all(c.get("ok", False) for c in checks)
+    # Informational checks (e.g. TCP probe against a UDP RCL endpoint) don't
+    # count against the overall verdict.
+    authoritative = [c for c in checks if not c.get("informational")]
+    overall = all(c.get("ok", False) for c in authoritative)
     return {
         "ok": overall,
         "instance": inst.to_dict(),
         "checks": checks,
-        "summary": f"{sum(c['ok'] for c in checks)} / {len(checks)} checks passed",
+        "summary": f"{sum(c['ok'] for c in authoritative)} / {len(authoritative)} authoritative checks passed",
     }
