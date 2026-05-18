@@ -5,30 +5,59 @@ from __future__ import annotations
 from pydantic import BaseModel, Field
 
 from ..session import all_instances, ensure_instance, shutdown_instance
-from ..t32_process import registry, render_config_t32, supported_arches
+from ..t32_process import SUPPORTED_BACKENDS, registry, render_config_t32, supported_arches
 
 
 class SpawnInput(BaseModel):
     arch: str = Field(
         default="arm",
-        description=f"CPU family. One of: {supported_arches()}",
+        description=f"CPU family — picks the binary (t32marm/t32mppc/...). One of: {supported_arches()}",
     )
-    port: int | None = Field(default=None, description="Pin a specific port. Default: pick a free one.")
+    backend: str = Field(
+        default="sim",
+        description=(
+            f"Runtime backend, picks the PBI section. One of: {list(SUPPORTED_BACKENDS)}. "
+            "'sim' = instruction-set simulator (no hardware). "
+            "'usb' = PowerDebug attached via USB on this host. "
+            "'net' = PowerDebug attached via Ethernet (provide target_host). "
+            "'usb_proxy' = PowerDebug on a remote host running t32tcpusb (provide target_host). "
+            "'custom' = supply the entire PBI section via extra_config."
+        ),
+    )
+    target_host: str | None = Field(
+        default=None,
+        description=(
+            "For backend='net': PowerDebug device name or IP (becomes NODE=). "
+            "For backend='usb_proxy': proxy machine IP (becomes PROXYNAME=). "
+            "Not used by 'sim' or 'usb'."
+        ),
+    )
+    target_node: str | None = Field(
+        default=None,
+        description=(
+            "Optional PowerDebug device disambiguation name (NODE=) for 'usb' / 'usb_proxy' "
+            "when multiple PowerDebugs are connected. Default: TRACE32 picks first found."
+        ),
+    )
+    proxy_port: int = Field(
+        default=8866, ge=1, le=65535,
+        description="For backend='usb_proxy': t32tcpusb port on the proxy host (default 8866).",
+    )
+    port: int | None = Field(default=None, description="RCL port to bind. Default: pick a free one.")
     node_name: str | None = Field(default=None, description="Friendly node id. Default: T32_<ARCH>_<port>.")
     t32sys: str | None = Field(default=None, description="Override $T32SYS for this spawn.")
     headless: bool = Field(default=False, description="Hint at no-display mode (Linux only).")
     extra_config: str | None = Field(
         default=None,
         description=(
-            "Optional extra config.t32 lines appended after the standard "
-            "OS/PBI/RCL/SCREEN sections. Use this for `SYStem.CPU <name>`-"
-            "style preconfig, license file paths, or custom AREAs. Sections "
-            "in TRACE32 config are separated by blank lines."
+            "Optional extra config.t32 lines appended after the standard sections. Use for "
+            "`SYStem.CPU <name>`-style preconfig, license paths, or custom AREAs. With "
+            "backend='custom' this MUST contain the entire PBI section yourself."
         ),
     )
     timeout_seconds: float = Field(
         default=45.0, ge=5.0, le=300.0,
-        description="How long to wait for the RCL port to open after spawn. Bump on slow Windows boxes.",
+        description="How long to wait for the RCL port to open after spawn. Bump for slow Windows boxes / hardware boot.",
     )
 
 
@@ -53,6 +82,13 @@ class GetLogInput(BaseModel):
 class RenderConfigInput(BaseModel):
     port: int = Field(default=20000, description="Port to bake into the RCL section.")
     node_name: str = Field(default="T32", description="Node id used in ID= and HEADER=.")
+    backend: str = Field(
+        default="sim",
+        description=f"PBI backend variation. One of: {list(SUPPORTED_BACKENDS)}",
+    )
+    target_host: str | None = Field(default=None, description="For 'net' / 'usb_proxy' backends.")
+    target_node: str | None = Field(default=None, description="Optional PowerDebug NODE disambiguation.")
+    proxy_port: int = Field(default=8866, ge=1, le=65535, description="For 'usb_proxy' backend.")
     extra_config: str | None = Field(default=None, description="Optional extra lines appended after standard sections.")
 
 
@@ -66,6 +102,10 @@ def t32_spawn(args: dict) -> dict:
             t32sys=p.t32sys,
             auto_spawn=True,
             headless=p.headless,
+            backend=p.backend,
+            target_host=p.target_host,
+            target_node=p.target_node,
+            proxy_port=p.proxy_port,
             extra_config=p.extra_config,
             timeout_seconds=p.timeout_seconds,
         )
@@ -85,20 +125,29 @@ def t32_shutdown(args: dict) -> dict:
 
 def t32_render_config(args: dict) -> dict:
     """Dry-run: return the literal config.t32 that t32_spawn would write,
-    without actually spawning. Use this when RCL fails to bind and you need
-    to inspect or debug the planned config before launching TRACE32."""
+    without actually spawning. Use this when RCL fails to bind, when you
+    want to verify the PBI section for a real-hardware backend, or to copy
+    the config into an existing PowerView's config.t32 by hand."""
     p = RenderConfigInput(**args)
+    try:
+        body = render_config_t32(
+            port=p.port, node=p.node_name,
+            backend=p.backend, target_host=p.target_host,
+            target_node=p.target_node, proxy_port=p.proxy_port,
+            extra_config=p.extra_config,
+        )
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
     return {
         "ok": True,
-        "config_t32": render_config_t32(
-            port=p.port, node=p.node_name, extra_config=p.extra_config,
-        ),
+        "backend": p.backend,
+        "config_t32": body,
         "note": (
             "This is what t32_spawn would write to config.t32. TRACE32 reads it "
-            "at startup; if RCL doesn't bind the port, double-check the "
-            "PBI / RCL section layout against your TRACE32 build's docs and "
-            "consider passing `extra_config` to t32_spawn with a `SYStem.CPU` "
-            "line for the exact CPU you're targeting."
+            "at startup; if RCL doesn't bind the port for hardware backends, "
+            "verify the PowerDebug is connected / reachable and the NODE= line "
+            "matches the device identity (see installation.pdf §PBI via "
+            "t32_search_manuals)."
         ),
     }
 

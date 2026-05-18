@@ -190,8 +190,7 @@ OS=
 ID=T32_{node}
 TMP={tmp_path}
 
-PBI=SIM
-
+{pbi_section}
 RCL=NETASSIST
 PACKLEN={packlen}
 PORT={port}
@@ -199,16 +198,76 @@ PORT={port}
 SCREEN=
 HEADER=Trace32-MCP {node}
 """
-# Layout notes (verified against TRACE32 docs via the bundled manuals search):
+# Layout notes (verified via the bundled manuals search):
 #   * Each section starts with `KEY=` and ends at the next blank line.
-#   * `PBI=SIM` on a single line enables the instruction-set simulator backend.
-#     Both single-line `PBI=SIM` and multi-line `PBI=\nSIM` forms are valid;
-#     int_codeblock.pdf p7 and app_python.pdf p9 both show the single-line form
-#     in working production configs.
-#   * `RCL=NETASSIST` opens a Remote API *UDP* port (per installation.pdf p51).
-#     PORT and PACKLEN must be inside the RCL section (separated by blank
-#     lines from neighbouring sections). PACKLEN should precede PORT per
-#     the codeblock and app_python examples.
+#   * The PBI section configures the backend. Per installation.pdf p42-47 and
+#     training_debugger.pdf p16-19, the canonical form uses the multi-line
+#     layout with the variation on the next line — same across SIM/USB/NET.
+#   * `RCL=NETASSIST` opens a Remote API *UDP* port. PORT and PACKLEN must be
+#     inside the RCL section (PACKLEN before PORT per the codeblock + python
+#     examples).
+
+
+# ---------------------------------------------------------------------------
+# Supported backends. The PBI variation is the *runtime* backend (sim vs real
+# debugger); arch (above) still chooses the *binary* (t32marm, t32mppc, ...).
+# Both have to be set correctly: e.g. arch=cortexm + backend=usb runs
+# `t32marm` against a real PowerDebug via USB.
+# ---------------------------------------------------------------------------
+SUPPORTED_BACKENDS = ("sim", "usb", "net", "usb_proxy", "custom")
+
+
+def _pbi_section(
+    backend: str,
+    *,
+    target_host: str | None = None,
+    target_node: str | None = None,
+    proxy_port: int = 8866,
+) -> str:
+    """Build the PBI section for a chosen backend.
+
+    Why the form differs per backend:
+      * SIM has no extra parameters, so the single-line `PBI=SIM` form is the
+        idiom used by Lauterbach's own examples (int_codeblock.pdf p7,
+        app_python.pdf p9).
+      * Hardware backends (USB / NET) carry extra parameters like NODE= or
+        PROXY*. Those parameters MUST sit inside the PBI section, which forces
+        the multi-line `PBI=\\n<VARIATION>\\n<KEY>=<VAL>` layout (per
+        installation.pdf p42-47).
+    Both forms are accepted by TRACE32 for sectionless backends like SIM, but
+    we match the documented form for each case to keep the config recognisable.
+    """
+    # Each branch returns a block ending in "\n". Combined with the template's
+    # own newline after {pbi_section}, that becomes a blank line separator
+    # between the PBI section and the next section — required per
+    # api_remote_c.pdf p17 ("between two empty lines").
+    if backend == "sim":
+        return "PBI=SIM\n"
+    if backend == "usb":
+        lines = ["PBI=", "USB"]
+        if target_node:
+            lines.append(f"NODE={target_node}")
+        return "\n".join(lines) + "\n"
+    if backend == "net":
+        if not target_host:
+            raise ValueError(
+                "backend='net' requires target_host (the PowerDebug device's "
+                "Ethernet name or IP, e.g. 'training1' or '10.0.5.7')"
+            )
+        return f"PBI=\nNET\nNODE={target_host}\n"
+    if backend == "usb_proxy":
+        if not target_host:
+            raise ValueError(
+                "backend='usb_proxy' requires target_host (proxy machine IP that "
+                "runs t32tcpusb in front of the USB PowerDebug)"
+            )
+        lines = ["PBI=", "USB", f"PROXYNAME={target_host}", f"PROXYPORT={proxy_port}"]
+        if target_node:
+            lines.append(f"NODE={target_node}")
+        return "\n".join(lines) + "\n"
+    if backend == "custom":
+        return ""  # caller provides via extra_config
+    raise ValueError(f"unknown backend {backend!r}. Supported: {SUPPORTED_BACKENDS}")
 
 
 def write_config_t32(
@@ -217,20 +276,28 @@ def write_config_t32(
     port: int,
     node: str,
     packlen: int = 1024,
+    backend: str = "sim",
+    target_host: str | None = None,
+    target_node: str | None = None,
+    proxy_port: int = 8866,
     extra_config: str | None = None,
 ) -> Path:
     """Generate a TRACE32 config.t32 in dst_dir.
 
-    `extra_config` is appended verbatim after the standard sections (useful
-    for arch-specific CPU= lines, license file paths, custom AREA defaults, ...).
-    Cross-platform: TMP= uses the OS-native temp dir, emitted as a forward-slash
-    path which TRACE32 accepts on every host.
+    `backend` selects the PBI section (sim / usb / net / usb_proxy / custom).
+    `extra_config` is appended verbatim after the standard sections (use for
+    `SYStem.CPU` picks, license paths, or to supply the entire PBI section
+    yourself with backend='custom').
     """
     import tempfile as _tf
     dst_dir.mkdir(parents=True, exist_ok=True)
     tmp_path = Path(_tf.gettempdir()).as_posix()
+    pbi_block = _pbi_section(
+        backend, target_host=target_host, target_node=target_node, proxy_port=proxy_port,
+    )
     body = CONFIG_T32_TEMPLATE.format(
         port=port, node=node, packlen=packlen, tmp_path=tmp_path,
+        pbi_section=pbi_block,
     )
     if extra_config:
         body += "\n" + extra_config.rstrip() + "\n"
@@ -239,15 +306,28 @@ def write_config_t32(
     return cfg
 
 
-def render_config_t32(*, port: int = 20000, node: str = "T32", packlen: int = 1024,
-                      extra_config: str | None = None) -> str:
+def render_config_t32(
+    *,
+    port: int = 20000,
+    node: str = "T32",
+    packlen: int = 1024,
+    backend: str = "sim",
+    target_host: str | None = None,
+    target_node: str | None = None,
+    proxy_port: int = 8866,
+    extra_config: str | None = None,
+) -> str:
     """Return the config.t32 contents that would be written for a given spawn,
     without touching the filesystem. Useful for AI agents to sanity-check
     the planned config before invoking t32_spawn."""
     import tempfile as _tf
     tmp_path = Path(_tf.gettempdir()).as_posix()
+    pbi_block = _pbi_section(
+        backend, target_host=target_host, target_node=target_node, proxy_port=proxy_port,
+    )
     body = CONFIG_T32_TEMPLATE.format(
         port=port, node=node, packlen=packlen, tmp_path=tmp_path,
+        pbi_section=pbi_block,
     )
     if extra_config:
         body += "\n" + extra_config.rstrip() + "\n"
@@ -439,16 +519,21 @@ def spawn(
     node_name: str | None = None,
     t32sys: str | None = None,
     headless: bool = False,
+    backend: str = "sim",
+    target_host: str | None = None,
+    target_node: str | None = None,
+    proxy_port: int = 8866,
     extra_args: list[str] | None = None,
     extra_config: str | None = None,
     timeout_seconds: float = 45.0,
 ) -> T32Instance:
-    """Launch a TRACE32 PowerView/simulator process and wait for its RCL port.
+    """Launch a TRACE32 PowerView (sim or PowerDebug) and wait for its RCL port.
 
-    `extra_config` is appended to the generated config.t32 (use for CPU= picks,
-    license paths, custom AREA defaults).
-    `extra_args` is appended to the binary argv.
-    Raises SpawnTimeout if the process is up but the port never responds.
+    `arch` chooses the binary (t32marm, t32mppc, ...). `backend` chooses the
+    runtime PBI section (sim / usb / net / usb_proxy / custom). For 'net' or
+    'usb_proxy' supply `target_host`. For 'custom' provide the entire PBI
+    section via `extra_config` and leave backend='custom'.
+    Raises SpawnTimeout if the process starts but RCL never responds.
     In fake mode (T32_MCP_FAKE=1) returns a registered fake instance without
     launching anything.
     """
@@ -465,7 +550,11 @@ def spawn(
 
     work_dir = Path(tempfile.mkdtemp(prefix=f"trace32_mcp_{node}_"))
     config_path = write_config_t32(
-        work_dir, port=chosen_port, node=node, extra_config=extra_config,
+        work_dir,
+        port=chosen_port, node=node,
+        backend=backend, target_host=target_host, target_node=target_node,
+        proxy_port=proxy_port,
+        extra_config=extra_config,
     )
     log_path = work_dir / "t32.log"
 
@@ -529,17 +618,22 @@ def spawn(
             f"--- TRACE32 stdout/stderr tail ({log_path}) ---\n{log_tail}\n"
             f"--- diagnostic checklist ---\n"
             f"  * RCL=NETASSIST opens a UDP port (not TCP). Readiness probe\n"
-            f"    uses the real T32_Init+T32_Attach handshake; if it fails\n"
-            f"    that means either T32 isn't listening or the t32api wrapper\n"
-            f"    can't reach the configured port.\n"
+            f"    uses the real T32_Init+T32_Attach handshake; failure means\n"
+            f"    either T32 isn't listening or the t32api wrapper can't reach\n"
+            f"    the configured port.\n"
+            f"  * Backend was '{backend}'. For 'usb' / 'net' / 'usb_proxy',\n"
+            f"    TRACE32 also has to find the PowerDebug hardware itself —\n"
+            f"    if the device isn't connected / reachable, PowerView opens\n"
+            f"    in serial-monitor mode and RCL never arms. Check the\n"
+            f"    subprocess log above for 'no device' / 'cannot connect'.\n"
             f"  * Windows Defender Firewall can silently block UDP bind on a\n"
             f"    new port the first time PowerView runs. Allow inbound UDP\n"
             f"    on the TRACE32 executable for the chosen port.\n"
             f"  * Some CPUs need an explicit `SYStem.CPU <name>` line.\n"
             f"    Pass `extra_config` to t32_spawn to inject it.\n"
-            f"  * Run t32_render_config first to dry-run the config that would\n"
-            f"    be written, and compare against the working configs in\n"
-            f"    int_codeblock.pdf p7 / app_python.pdf p9 (use t32_search_manuals).\n"
+            f"  * Run t32_render_config (with the same backend / target_host)\n"
+            f"    first to dry-run the config and compare against working\n"
+            f"    examples — see installation.pdf p42-47 via t32_search_manuals.\n"
         )
 
     log_fh.close()

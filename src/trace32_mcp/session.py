@@ -74,6 +74,10 @@ def ensure_instance(
     t32sys: str | None = None,
     auto_spawn: bool = True,
     headless: bool = False,
+    backend: str = "sim",
+    target_host: str | None = None,
+    target_node: str | None = None,
+    proxy_port: int = 8866,
     extra_config: str | None = None,
     timeout_seconds: float = 45.0,
 ) -> tuple[T32Instance, T32Client]:
@@ -91,14 +95,18 @@ def ensure_instance(
     if target_port is not None and is_port_open(target_host, target_port):
         inst = attach(target_host, target_port, node_name=node_name, arch=arch)
     elif auto_spawn:
-        # We call spawn() directly so we can pass extra_config + timeout_seconds.
-        # connect_or_spawn is the older convenience wrapper without those knobs.
+        # We call spawn() directly so we can pass all the knobs.
+        # connect_or_spawn is the older convenience wrapper without them.
         inst = spawn_t32(
             arch=arch,
             port=target_port,
             node_name=node_name,
             t32sys=t32sys or cfg.t32sys,
             headless=headless,
+            backend=backend,
+            target_host=target_host,
+            target_node=target_node,
+            proxy_port=proxy_port,
             extra_config=extra_config,
             timeout_seconds=timeout_seconds,
         )
