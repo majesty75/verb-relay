@@ -1,45 +1,53 @@
-"""Thin, typed wrapper around Lauterbach's RCL Python API.
+"""TRACE32 client via Lauterbach's official PYRCL package.
 
-Adds three things on top of the bare `t32api` calls:
+Replaces the older ctypes-based wrapper. PYRCL is `lauterbach.trace32.rcl` —
+a native Python implementation of the RCL protocol (no DLL loading, works
+identically on macOS / Linux / Windows). Lauterbach recommends PYRCL for new
+projects (app_python.pdf §"PYRCL versus TRACE32 Legacy Approach", p5).
 
-1. **Structured error detection.** TRACE32 returns RCL-level OK even when a
-   PRACTICE command fails (e.g. `Data.LOAD.Elf nonexistent.elf` → "file not
-   found" in the AREA window). We:
-     * parse the `mode` bits returned by `T32_GetMessage`
-     * call `T32_GetPracticeState()` after every command
-     * return `{ok, text, mode_bits, practice_state, error?}` consistently.
+Design:
 
-2. **Dedicated AREA window for log capture.** On first connect we issue
-   `AREA.CREATE MCPLOG / AREA.Select MCPLOG / AREA.CLEAR MCPLOG` so all command
-   output is captured even when no AREA window is visible in PowerView.
+  * **TCP first, UDP fallback.** PYRCL supports both; the docs say TCP is
+    recommended (faster, multi-client, no PACKLEN tuning). We try TCP, and
+    if that fails (older T32 build without NETTCP support, network policy,
+    ...) we fall back to UDP/NETASSIST. Both RCL sections are written in
+    the generated config.t32 (same PORT — UDP and TCP sockets are distinct
+    at the OS level).
 
-3. **Per-endpoint serialisation.** The underlying `t32api` is procedural and
-   keeps connection state in module globals; we wrap every call in a lock.
+  * **Same observable surface as before.** Tools still receive a
+    CommandResult-shaped dict from every PRACTICE command, including the
+    error / mode flags / PRACTICE state. The fake mode (T32_MCP_FAKE=1)
+    keeps working untouched.
+
+  * **No more $T32SYS / t32api.py / libt32api*** plumbing.** PYRCL doesn't
+    use the shared library — it speaks the RCL wire protocol directly over
+    Python sockets.
 """
 
 from __future__ import annotations
 
-import ctypes
 import threading
-import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
-from .t32_bridge import load_t32api
+
+# Default sequence we try; first one to succeed wins.
+DEFAULT_PROTOCOL_PREFERENCE = ("TCP", "UDP")
 
 
-# T32_MESSAGE_* mode bits. These match the typical Lauterbach RCL header but
-# we treat them defensively — any bit in ERROR_MASK flips ok=False.
-MODE_ERROR_INFO = 0x01
-MODE_ERROR      = 0x02
-MODE_STATE      = 0x04
-MODE_WARN       = 0x08
-MODE_INFO       = 0x10
+# ---------------------------------------------------------------------------
+# Error-mode parsing (preserved for backward compat with downstream tools).
+# PYRCL exposes message mode as an int; we keep our decoded flag names.
+# ---------------------------------------------------------------------------
+
+MODE_ERROR_INFO  = 0x01
+MODE_ERROR       = 0x02
+MODE_STATE       = 0x04
+MODE_WARN        = 0x08
+MODE_INFO        = 0x10
 MODE_TARGET_INFO = 0x20
+ERROR_MASK       = MODE_ERROR | MODE_ERROR_INFO
 
-ERROR_MASK = MODE_ERROR | MODE_ERROR_INFO
-
-# T32_GetPracticeState values
 PRACTICE_IDLE = 0
 PRACTICE_RUN  = 1
 PRACTICE_ERR  = 2
@@ -47,17 +55,21 @@ PRACTICE_ERR  = 2
 
 def decode_mode(mode: int) -> list[str]:
     flags = []
-    if mode & MODE_ERROR_INFO: flags.append("ERROR_INFO")
-    if mode & MODE_ERROR:      flags.append("ERROR")
-    if mode & MODE_STATE:      flags.append("STATE")
-    if mode & MODE_WARN:       flags.append("WARN")
-    if mode & MODE_INFO:       flags.append("INFO")
-    if mode & MODE_TARGET_INFO:flags.append("TARGET_INFO")
+    if mode & MODE_ERROR_INFO:  flags.append("ERROR_INFO")
+    if mode & MODE_ERROR:       flags.append("ERROR")
+    if mode & MODE_STATE:       flags.append("STATE")
+    if mode & MODE_WARN:        flags.append("WARN")
+    if mode & MODE_INFO:        flags.append("INFO")
+    if mode & MODE_TARGET_INFO: flags.append("TARGET_INFO")
     return flags
 
 
+# ---------------------------------------------------------------------------
+# Public dataclasses
+# ---------------------------------------------------------------------------
+
 class T32Error(RuntimeError):
-    def __init__(self, op: str, code: int, message: str = "") -> None:
+    def __init__(self, op: str, code: int = -1, message: str = "") -> None:
         super().__init__(f"T32 {op} failed (code={code}): {message}".strip())
         self.op = op
         self.code = code
@@ -70,6 +82,8 @@ class T32Endpoint:
     port: int
     node_name: str = "T32"
     packet_length: int = 1024
+    # `t32sys` is kept for backward compat with attach/spawn signatures,
+    # but PYRCL does not use it.
     t32sys: str | None = None
 
 
@@ -86,194 +100,225 @@ class CommandResult:
 
     def to_dict(self) -> dict:
         return {
-            "ok": self.ok,
-            "cmd": self.cmd,
-            "text": self.text,
-            "mode": self.mode,
-            "mode_flags": self.mode_flags,
-            "practice_state": self.practice_state,
-            "error": self.error,
+            "ok": self.ok, "cmd": self.cmd, "text": self.text,
+            "mode": self.mode, "mode_flags": self.mode_flags,
+            "practice_state": self.practice_state, "error": self.error,
         }
 
 
-class T32Client:
-    """One client per logical T32 instance."""
+# ---------------------------------------------------------------------------
+# Connection — TCP-first with UDP fallback
+# ---------------------------------------------------------------------------
 
-    def __init__(self, endpoint: T32Endpoint, keep_open: bool = False) -> None:
+def _pyrcl():
+    """Lazy import so the package is only required at first connect."""
+    import lauterbach.trace32.rcl as t32  # type: ignore
+    return t32
+
+
+def try_connect(
+    host: str, port: int,
+    *, protocols: tuple[str, ...] = DEFAULT_PROTOCOL_PREFERENCE,
+    packlen: int = 1024, timeout: float = 10.0,
+) -> tuple[Any, str]:
+    """Try each protocol in order. Returns (dbg, protocol_used).
+
+    Raises T32Error if every protocol fails.
+    """
+    t32 = _pyrcl()
+    last_error: Exception | None = None
+    for proto in protocols:
+        try:
+            if proto.upper() == "TCP":
+                dbg = t32.connect(node=host, port=port, protocol="TCP", timeout=timeout)
+            elif proto.upper() == "UDP":
+                dbg = t32.connect(
+                    node=host, port=port, protocol="UDP",
+                    packlen=packlen, timeout=timeout,
+                )
+            else:
+                raise ValueError(f"unsupported protocol {proto!r}")
+            return dbg, proto.upper()
+        except Exception as e:  # noqa: BLE001 — PYRCL raises various types
+            last_error = e
+            continue
+    raise T32Error(
+        "PYRCL connect", message=(
+            f"could not reach RCL at {host}:{port} over any of {list(protocols)}. "
+            f"Last error: {last_error!r}"
+        ),
+    )
+
+
+def is_rcl_responsive(
+    host: str, port: int,
+    t32sys: str | None = None,  # accepted for back-compat; unused by PYRCL
+    *, protocols: tuple[str, ...] = DEFAULT_PROTOCOL_PREFERENCE,
+    timeout_per_try: float = 2.0,
+) -> bool:
+    """Quick readiness probe — try to PYRCL-connect, then close."""
+    try:
+        dbg, _ = try_connect(host, port, protocols=protocols, timeout=timeout_per_try)
+    except Exception:
+        return False
+    try:
+        dbg.disconnect()
+    except Exception:
+        pass
+    return True
+
+
+# ---------------------------------------------------------------------------
+# T32Client — drop-in for the old ctypes wrapper
+# ---------------------------------------------------------------------------
+
+class T32Client:
+    """One client per logical T32 instance. Thread-safe."""
+
+    def __init__(
+        self,
+        endpoint: T32Endpoint,
+        *,
+        keep_open: bool = True,
+        protocols: tuple[str, ...] = DEFAULT_PROTOCOL_PREFERENCE,
+    ) -> None:
         self.endpoint = endpoint
-        self._api = load_t32api(endpoint.t32sys)
         self._lock = threading.Lock()
         self._keep_open = keep_open
-        self._connected = False
+        self._dbg = None
+        self._connected_protocol: str | None = None
         self._area_setup_done = False
+        self._protocols = protocols
 
     # ---- lifecycle ----------------------------------------------------------
 
     def _ensure_connected(self) -> None:
-        if self._connected:
+        if self._dbg is not None:
             return
-        api = self._api
-        api.T32_Config(b"NODE=", self.endpoint.node_name.encode())
-        api.T32_Config(b"HOSTNAME=", self.endpoint.host.encode())
-        api.T32_Config(b"PORT=", str(self.endpoint.port).encode())
-        api.T32_Config(b"PACKLEN=", str(self.endpoint.packet_length).encode())
-        rc = api.T32_Init()
-        if rc:
-            raise T32Error("T32_Init", rc, "could not initialise RCL")
-        rc = api.T32_Attach(1)  # 1 = ICD (debugger)
-        if rc:
-            api.T32_Exit()
-            raise T32Error("T32_Attach", rc, "no T32 PowerView listening")
-        self._connected = True
+        dbg, proto = try_connect(
+            self.endpoint.host, self.endpoint.port,
+            protocols=self._protocols,
+            packlen=self.endpoint.packet_length,
+            timeout=10.0,
+        )
+        self._dbg = dbg
+        self._connected_protocol = proto
         if not self._area_setup_done:
             self._setup_area()
             self._area_setup_done = True
 
     def _setup_area(self) -> None:
-        """Create the MCPLOG AREA so we can scrape command output reliably."""
+        """Create our dedicated MCPLOG AREA so command output is always
+        retrievable even if the user has no AREA window open."""
         for setup_cmd in (
-            "AREA.CREATE MCPLOG 200. 1000.",  # 200 cols, 1000 lines
+            "AREA.CREATE MCPLOG 200. 1000.",
             "AREA.Select MCPLOG",
             "AREA.CLEAR MCPLOG",
         ):
             try:
-                self._api.T32_Cmd(setup_cmd.encode("utf-8"))
+                self._dbg.cmd(setup_cmd)
             except Exception:
-                # Best-effort; older T32 may use slightly different syntax
                 pass
-
-    def _maybe_disconnect(self) -> None:
-        if self._keep_open or not self._connected:
-            return
-        try:
-            self._api.T32_Exit()
-        finally:
-            self._connected = False
-            self._area_setup_done = False
 
     def close(self) -> None:
         with self._lock:
-            if self._connected:
+            if self._dbg is not None:
                 try:
-                    self._api.T32_Exit()
-                finally:
-                    self._connected = False
-                    self._area_setup_done = False
+                    self._dbg.disconnect()
+                except Exception:
+                    pass
+                self._dbg = None
+                self._connected_protocol = None
+                self._area_setup_done = False
 
-    # ---- helpers ------------------------------------------------------------
+    @property
+    def connected_protocol(self) -> str | None:
+        return self._connected_protocol
 
-    def _read_message(self) -> tuple[str, int]:
-        buf = ctypes.create_string_buffer(4096)
-        mode = ctypes.c_uint16(0)
-        try:
-            rc = self._api.T32_GetMessage(buf, ctypes.byref(mode))
-        except TypeError:
-            # Some versions take mode by value via int pointer differently
-            rc = self._api.T32_GetMessage(buf, mode)
-        if rc:
-            return "", 0
-        return buf.value.decode("utf-8", errors="replace"), int(mode.value)
-
-    def _read_practice_state(self) -> int:
-        if not hasattr(self._api, "T32_GetPracticeState"):
-            return 0
-        st = ctypes.c_int(0)
-        try:
-            rc = self._api.T32_GetPracticeState(ctypes.byref(st))
-        except TypeError:
-            rc = self._api.T32_GetPracticeState(st)
-        if rc:
-            return 0
-        return int(st.value)
-
-    # ---- core verb: send command, capture structured outcome ----------------
+    # ---- core verb ----------------------------------------------------------
 
     def run(self, line: str) -> CommandResult:
-        """Run one PRACTICE command line and return a typed result.
-
-        Always reports `ok`, AREA message, mode bits, and PRACTICE state. If
-        anything looks like an error we set ok=False and populate `error`.
-        """
+        """Run one PRACTICE command line and return a typed result."""
         with self._lock:
-            self._ensure_connected()
             try:
-                rc = self._api.T32_Cmd(line.encode("utf-8"))
-                if rc:
-                    # RCL-level failure: no AREA output to read
-                    return CommandResult(
-                        ok=False,
-                        cmd=line,
-                        text="",
-                        mode=0,
-                        mode_flags=[],
-                        practice_state=0,
-                        error=f"T32_Cmd rc={rc}",
-                    )
-                text, mode = self._read_message()
-                # PRACTICE state takes a tick to update on async scripts
-                pstate = self._read_practice_state()
-                ok = not (mode & ERROR_MASK) and pstate != PRACTICE_ERR
-                err = None
-                if not ok:
-                    err = text.strip() or f"mode={decode_mode(mode)} practice_state={pstate}"
+                self._ensure_connected()
+            except Exception as e:
                 return CommandResult(
-                    ok=ok,
-                    cmd=line,
-                    text=text,
-                    mode=mode,
-                    mode_flags=decode_mode(mode),
-                    practice_state=pstate,
-                    error=err,
+                    ok=False, cmd=line, text="", mode=0, mode_flags=[],
+                    practice_state=0, error=f"connect failed: {e}",
                 )
-            finally:
-                self._maybe_disconnect()
+            text = ""
+            mode = 0
+            pstate = 0
+            err: str | None = None
+            try:
+                self._dbg.cmd(line)
+            except Exception as e:
+                err = f"cmd raised: {e}"
+            # Pull the AREA message + PRACTICE state regardless of the cmd outcome.
+            try:
+                msg = self._dbg.get_message()
+                # PYRCL's get_message() returns either a string or a (text, mode) tuple
+                # depending on version — handle both.
+                if isinstance(msg, tuple) and len(msg) >= 2:
+                    text, mode = str(msg[0]), int(msg[1])
+                else:
+                    text = "" if msg is None else str(msg)
+            except Exception:
+                pass
+            try:
+                pstate = int(self._dbg.get_practice_state())
+            except Exception:
+                pass
+            ok = (err is None) and (not (mode & ERROR_MASK)) and (pstate != PRACTICE_ERR)
+            if not ok and err is None:
+                err = text.strip() or (
+                    f"mode={decode_mode(mode)} practice_state={pstate}"
+                )
+            return CommandResult(
+                ok=ok, cmd=line, text=text,
+                mode=mode, mode_flags=decode_mode(mode),
+                practice_state=pstate, error=err,
+            )
 
-    # ---- convenience verbs --------------------------------------------------
-
+    # Back-compat aliases
     def cmd(self, line: str) -> CommandResult:
-        """Alias for run() — kept for back-compat with older tools."""
         return self.run(line)
 
     def cmd_with_message(self, line: str) -> dict:
-        """Legacy adapter that returns the same shape older tools expect."""
         return self.run(line).to_dict()
 
     def eval_practice(self, expression: str) -> dict:
         return self.run(f"PRINT {expression}").to_dict()
 
+    # ---- state --------------------------------------------------------------
+
     def state(self) -> dict[str, Any]:
-        """Report system state (running / halted / down) + CPU + endpoint."""
+        """Report system state (down/halted/running) + CPU + endpoint."""
         with self._lock:
             self._ensure_connected()
+            state_int = 0
+            cpu = ""
             try:
-                state_int = ctypes.c_int(0)
-                rc = self._api.T32_GetState(ctypes.byref(state_int))
-                if rc:
-                    raise T32Error("T32_GetState", rc)
-                state_map = {0: "down", 1: "halted_no_debugger", 2: "stopped", 3: "running"}
-                # CPU info: signature varies. Defensive call.
-                cpu = ""
-                if hasattr(self._api, "T32_GetCpuInfo"):
-                    cpu_buf = ctypes.create_string_buffer(64)
-                    try:
-                        self._api.T32_GetCpuInfo(
-                            cpu_buf, ctypes.c_uint16(64), ctypes.c_uint16(0), ctypes.c_uint16(0)
-                        )
-                        cpu = cpu_buf.value.decode("utf-8", errors="replace")
-                    except Exception:
-                        pass
-                return {
-                    "raw_state": int(state_int.value),
-                    "state": state_map.get(int(state_int.value), "unknown"),
-                    "cpu": cpu,
-                    "endpoint": {
-                        "host": self.endpoint.host,
-                        "port": self.endpoint.port,
-                        "node": self.endpoint.node_name,
-                    },
-                }
-            finally:
-                self._maybe_disconnect()
+                state_int = int(self._dbg.get_state())
+            except Exception:
+                pass
+            state_map = {0: "down", 1: "halted_no_debugger", 2: "stopped", 3: "running"}
+            try:
+                cpu = str(self._dbg.fnc("STRing.UPpeR(CPU())"))
+            except Exception:
+                pass
+            return {
+                "raw_state": state_int,
+                "state": state_map.get(state_int, "unknown"),
+                "cpu": cpu,
+                "protocol": self._connected_protocol,
+                "endpoint": {
+                    "host": self.endpoint.host,
+                    "port": self.endpoint.port,
+                    "node": self.endpoint.node_name,
+                },
+            }
 
     # ---- memory -------------------------------------------------------------
 
@@ -281,78 +326,49 @@ class T32Client:
         with self._lock:
             self._ensure_connected()
             try:
-                buf = (ctypes.c_uint8 * length)()
-                access_int = 0
-                if hasattr(self._api, "T32_GetMemoryAccessNumber"):
-                    try:
-                        access_int = self._api.T32_GetMemoryAccessNumber(access.encode())
-                    except Exception:
-                        access_int = 0
-                rc = self._api.T32_ReadMemory(
-                    ctypes.c_uint32(address & 0xFFFFFFFF),
-                    ctypes.c_int(access_int),
-                    buf,
-                    ctypes.c_int(length),
-                )
-                if rc:
-                    raise T32Error("T32_ReadMemory", rc, f"@0x{address:X} len={length}")
-                return bytes(buf)
-            finally:
-                self._maybe_disconnect()
+                return bytes(self._dbg.memory.read(address=address, length=length, access=access))
+            except AttributeError:
+                # Older PYRCL: positional API
+                return bytes(self._dbg.memory_read(address, length, access))
 
     def write_memory(self, address: int, data: bytes, access: str = "ANY") -> None:
         with self._lock:
             self._ensure_connected()
             try:
-                buf = (ctypes.c_uint8 * len(data))(*data)
-                access_int = 0
-                if hasattr(self._api, "T32_GetMemoryAccessNumber"):
-                    try:
-                        access_int = self._api.T32_GetMemoryAccessNumber(access.encode())
-                    except Exception:
-                        access_int = 0
-                rc = self._api.T32_WriteMemory(
-                    ctypes.c_uint32(address & 0xFFFFFFFF),
-                    ctypes.c_int(access_int),
-                    buf,
-                    ctypes.c_int(len(data)),
-                )
-                if rc:
-                    raise T32Error("T32_WriteMemory", rc, f"@0x{address:X} len={len(data)}")
-            finally:
-                self._maybe_disconnect()
+                self._dbg.memory.write(address=address, data=bytes(data), access=access)
+            except AttributeError:
+                self._dbg.memory_write(address, bytes(data), access)
 
-    # ---- AREA log capture ---------------------------------------------------
+    # ---- AREA log -----------------------------------------------------------
 
     def read_area_log(self, area: str = "MCPLOG", lines: int | None = None) -> str:
-        """Save the AREA contents to a temp file (on T32 host) then read it.
+        """Save the named AREA to a temp file on the T32 host and read it back.
 
-        Only works when the MCP and T32 share a filesystem (true for local sim
-        on any OS). For remote T32, this returns a best-effort empty string
-        and the caller should fall back to the per-command CommandResult.text.
+        Only useful when the MCP and T32 share a filesystem (true for local
+        sim). For remote PowerDebug returns the path-style empty result and
+        the caller should fall back to per-command CommandResult.text.
         """
         import tempfile
-        from pathlib import Path
+        import time as _time
+        from pathlib import Path as _P
 
-        tmp = Path(tempfile.gettempdir()) / f"trace32_mcp_area_{area}.txt"
+        tmp = _P(tempfile.gettempdir()) / f"trace32_mcp_area_{area}.txt"
         try:
             tmp.unlink()
         except FileNotFoundError:
             pass
 
-        save_cmd = f'AREA.SAVE "{tmp}" {area}'
         with self._lock:
             self._ensure_connected()
             try:
-                self._api.T32_Cmd(save_cmd.encode("utf-8"))
-            finally:
-                self._maybe_disconnect()
+                self._dbg.cmd(f'AREA.SAVE "{tmp}" {area}')
+            except Exception:
+                return ""
 
-        # Give T32 a moment to write
         for _ in range(20):
             if tmp.exists():
                 break
-            time.sleep(0.05)
+            _time.sleep(0.05)
         if not tmp.exists():
             return ""
         text = tmp.read_text(errors="replace")

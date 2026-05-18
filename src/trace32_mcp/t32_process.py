@@ -141,45 +141,17 @@ def is_port_open(host: str, port: int, timeout: float = 0.3) -> bool:
 
 
 def is_rcl_responsive(host: str, port: int, t32sys: str | None = None,
-                      timeout_per_try: float = 1.0) -> bool:
-    """Probe a TRACE32 RCL endpoint by performing the real handshake.
+                      timeout_per_try: float = 2.0) -> bool:
+    """Probe a TRACE32 RCL endpoint via PYRCL (tries TCP then UDP).
 
-    `RCL=NETASSIST` is UDP; you can't tell it's up with a TCP connect. The
-    only reliable readiness check is to send the actual RCL protocol bytes
-    (T32_Init + T32_Attach) and see if T32 answers.
-
-    Returns True iff the handshake round-trips. Eats every exception so the
-    spawn wait-loop can call this safely while T32 is still starting up.
+    Re-exported from t32_client so callers don't need to know the protocol
+    layer. `t32sys` is accepted for back-compat but ignored — PYRCL doesn't
+    need the T32 install path.
     """
-    try:
-        from .t32_bridge import load_t32api
-        api = load_t32api(t32sys)
-    except Exception:
-        return False
-    try:
-        api.T32_Config(b"NODE=", host.encode())
-        api.T32_Config(b"PORT=", str(port).encode())
-        api.T32_Config(b"PACKLEN=", b"1024")
-        if api.T32_Init() != 0:
-            return False
-        # T32_DEV_ICD = 1
-        if api.T32_Attach(1) != 0:
-            try:
-                api.T32_Exit()
-            except Exception:
-                pass
-            return False
-        try:
-            api.T32_Exit()
-        except Exception:
-            pass
-        return True
-    except Exception:
-        try:
-            api.T32_Exit()
-        except Exception:
-            pass
-        return False
+    # Lazy import keeps t32_process importable without PYRCL installed
+    # (e.g. during test collection in fake mode).
+    from .t32_client import is_rcl_responsive as _probe
+    return _probe(host, port, t32sys=t32sys, timeout_per_try=timeout_per_try)
 
 
 # --- config.t32 generation ---------------------------------------------------
@@ -189,23 +161,35 @@ CONFIG_T32_TEMPLATE = """\
 OS=
 ID=T32_{node}
 TMP={tmp_path}
-
+{sys_line}
 {pbi_section}
-RCL=NETASSIST
-PACKLEN={packlen}
+RCL=NETTCP
 PORT={port}
+
+RCL=NETASSIST
+PORT={port}
+PACKLEN={packlen}
 
 SCREEN=
 HEADER=Trace32-MCP {node}
 """
-# Layout notes (verified via the bundled manuals search):
-#   * Each section starts with `KEY=` and ends at the next blank line.
-#   * The PBI section configures the backend. Per installation.pdf p42-47 and
-#     training_debugger.pdf p16-19, the canonical form uses the multi-line
-#     layout with the variation on the next line — same across SIM/USB/NET.
-#   * `RCL=NETASSIST` opens a Remote API *UDP* port. PORT and PACKLEN must be
-#     inside the RCL section (PACKLEN before PORT per the codeblock + python
-#     examples).
+# Layout notes (verified via the bundled manuals search + pyrcl docs):
+#   * Each section starts with `KEY=` and is terminated by a blank line.
+#   * PBI section picks the backend (sim / usb / net / usb_proxy / custom).
+#   * BOTH RCL=NETTCP and RCL=NETASSIST sections are emitted so PYRCL can pick
+#     TCP (preferred) or fall back to UDP — same PORT value works for both
+#     because UDP/TCP are distinct sockets at the OS level.
+#     PYRCL example (https://pyrcl.readthedocs.io/en/latest/sub/intro_basics.html):
+#         RCL=NETTCP       <- TCP, stream, no PACKLEN
+#         PORT=20000
+#
+#         RCL=NETASSIST    <- UDP, packet, PACKLEN required
+#         PORT=20000
+#         PACKLEN=1024
+#   * SYS= under OS= explicitly tells T32 where its install lives, per
+#     installation.pdf p37 ("OS section / SYS=<path>"). When sys_path is unset
+#     we omit the line and TRACE32 falls back to deriving it from the
+#     executable path.
 
 
 # ---------------------------------------------------------------------------
@@ -270,6 +254,14 @@ def _pbi_section(
     raise ValueError(f"unknown backend {backend!r}. Supported: {SUPPORTED_BACKENDS}")
 
 
+def _sys_line(sys_path: str | os.PathLike | None) -> str:
+    """Render the optional SYS= line (under the OS= section)."""
+    if not sys_path:
+        return ""
+    # TRACE32 accepts forward-slash paths on every host.
+    return f"SYS={Path(sys_path).as_posix()}\n"
+
+
 def write_config_t32(
     dst_dir: Path,
     *,
@@ -280,14 +272,14 @@ def write_config_t32(
     target_host: str | None = None,
     target_node: str | None = None,
     proxy_port: int = 8866,
+    sys_path: str | os.PathLike | None = None,
     extra_config: str | None = None,
 ) -> Path:
     """Generate a TRACE32 config.t32 in dst_dir.
 
-    `backend` selects the PBI section (sim / usb / net / usb_proxy / custom).
-    `extra_config` is appended verbatim after the standard sections (use for
-    `SYStem.CPU` picks, license paths, or to supply the entire PBI section
-    yourself with backend='custom').
+    Emits both RCL=NETTCP and RCL=NETASSIST on the same PORT so PYRCL can
+    prefer TCP and fall back to UDP. `sys_path` becomes SYS= under OS=.
+    `extra_config` is appended verbatim after the standard sections.
     """
     import tempfile as _tf
     dst_dir.mkdir(parents=True, exist_ok=True)
@@ -297,7 +289,7 @@ def write_config_t32(
     )
     body = CONFIG_T32_TEMPLATE.format(
         port=port, node=node, packlen=packlen, tmp_path=tmp_path,
-        pbi_section=pbi_block,
+        pbi_section=pbi_block, sys_line=_sys_line(sys_path),
     )
     if extra_config:
         body += "\n" + extra_config.rstrip() + "\n"
@@ -315,6 +307,7 @@ def render_config_t32(
     target_host: str | None = None,
     target_node: str | None = None,
     proxy_port: int = 8866,
+    sys_path: str | os.PathLike | None = None,
     extra_config: str | None = None,
 ) -> str:
     """Return the config.t32 contents that would be written for a given spawn,
@@ -327,7 +320,7 @@ def render_config_t32(
     )
     body = CONFIG_T32_TEMPLATE.format(
         port=port, node=node, packlen=packlen, tmp_path=tmp_path,
-        pbi_section=pbi_block,
+        pbi_section=pbi_block, sys_line=_sys_line(sys_path),
     )
     if extra_config:
         body += "\n" + extra_config.rstrip() + "\n"
@@ -547,6 +540,7 @@ def spawn(
     binary = find_t32_binary(arch, t32sys=t32sys)
     chosen_port = port if port is not None else pick_free_port()
     node = node_name or f"T32_{arch.upper()}_{chosen_port}"
+    sys_root = binary.parent.parent.parent  # bin/<triple>/<bin> → install root
 
     work_dir = Path(tempfile.mkdtemp(prefix=f"trace32_mcp_{node}_"))
     config_path = write_config_t32(
@@ -554,6 +548,7 @@ def spawn(
         port=chosen_port, node=node,
         backend=backend, target_host=target_host, target_node=target_node,
         proxy_port=proxy_port,
+        sys_path=sys_root,
         extra_config=extra_config,
     )
     log_path = work_dir / "t32.log"

@@ -67,47 +67,57 @@ pip install -e ".[build]"
 
 ---
 
-## 3. Point the MCP at your TRACE32 install
+## 3. Point the MCP at your TRACE32 install (only needed for t32_spawn)
 
-The MCP auto-probes common paths (`C:\T32`, `~\t32`, `/Applications/t32`).
-If your install is elsewhere, set:
+`t32_spawn` needs to find the TRACE32 binary (e.g. `t32marm.exe`) to launch.
+Auto-probed paths: `C:\T32`, `~\t32`, `/Applications/t32`, `/opt/t32`,
+`/usr/local/t32`. If your install is elsewhere, set:
 
 ```powershell
 $env:T32SYS = "D:\Tools\T32"
 ```
 
-Quick verification — should print a real path without error:
+`t32_attach` (connect to an already-running PowerView) does NOT need this
+env var — it only talks to the network port.
+
+Quick verification — should resolve a real binary without error:
 
 ```powershell
-.venv\Scripts\python -c "from trace32_mcp.t32_bridge import _resolve_t32sys, _resolve_lib; r = _resolve_t32sys(None); print('root:', r); print('lib :', _resolve_lib(r))"
+.venv\Scripts\python -c "from trace32_mcp.t32_process import find_t32_binary; print(find_t32_binary('arm'))"
 ```
 
 You should see something like:
 ```
-root: C:\T32
-lib : C:\T32\demo\api\python\t32api64.dll
+C:\T32\bin\windows64\t32marm.exe
 ```
 
 ---
 
 ## 4. Configure TRACE32 for RCL
 
-The MCP talks to PowerView over the Lauterbach Remote Control protocol. Edit
+The MCP talks to PowerView via the Lauterbach **PYRCL** package (no DLL
+loading — pure Python sockets). It prefers TCP and falls back to UDP. Edit
 the `config.t32` of any instance you want the MCP to drive (or let the MCP
 spawn its own — it generates the right config automatically).
 
-For a **manually-launched** PowerView, add to its `config.t32`:
+For a **manually-launched** PowerView, add both RCL sections to its
+`config.t32` so the MCP can use TCP (recommended) and fall back to UDP:
 
 ```
+RCL=NETTCP
+PORT=20000
+
 RCL=NETASSIST
 PORT=20000
 PACKLEN=1024
 ```
 
-then restart PowerView. The MCP defaults to `127.0.0.1:20000`.
+then restart PowerView. The MCP defaults to `127.0.0.1:20000`. Same PORT
+value works for both because UDP and TCP are distinct sockets at the OS
+level.
 
 For **MCP-spawned** PowerView, no manual config needed — `t32_spawn` writes a
-config file with auto-picked free port.
+config file with auto-picked free port and both RCL sections.
 
 ---
 
@@ -200,12 +210,12 @@ the AI needs to look up syntax first.
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| `Could not locate a TRACE32 installation` | `T32SYS` unset and `C:\T32` doesn't exist | `$env:T32SYS = "your-install-path"` |
-| `Could not find a t32api shared library` | TRACE32 install is missing the API folder | Re-run the Lauterbach installer with "API" component checked |
-| `T32_Attach failed (code=...)` | Nothing listening on the requested port | Check `config.t32` has `RCL=NETASSIST` and `PORT=<your port>` |
-| `tcp_port_open: false` from `t32_healthcheck` | Firewall blocking 127.0.0.1:port | Allow Python in Windows Firewall, or use a different port |
+| `could not find t32marm.exe` | `T32SYS` unset and `C:\T32` doesn't exist | `$env:T32SYS = "your-install-path"` (only needed for `t32_spawn`) |
+| `PYRCL connect failed` | Nothing on the port, or no RCL section in `config.t32` | Verify the running PowerView's `config.t32` has both `RCL=NETTCP` + `RCL=NETASSIST` (or at least one) with matching `PORT=` |
+| `rcl_handshake: false` from healthcheck | RCL not bound — TRACE32 launched in serial-monitor mode | Hardware backend (USB/NET) needs the PowerDebug actually connected. Run `t32_render_config` to inspect, then re-spawn |
+| `tcp_port_open: false` (informational) | Expected when using UDP/NETASSIST | This is informational only; the authoritative `rcl_handshake` check is what matters |
 | MCP-spawned T32 dies right away | License missing for that CPU family | Use a different arch (sim allows ARM unlicensed) or set up Reprise License Mgr |
-| "OCR fragment" results in search | These are screenshot-extracted texts | Working as designed — they're prefixed `[OCR pN]` |
+| "OCR fragment" results in search | These are screenshot-extracted texts | Working as designed — prefixed `[OCR pN]` |
 
 For deeper diagnostics, the MCP logs to stderr at `INFO` by default:
 

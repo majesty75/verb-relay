@@ -23,6 +23,9 @@ dependencies = [
     "sentence-transformers>=3.0.0",
     "torch>=2.2.0",
     "zstandard>=0.22.0",
+    # Lauterbach's official native Python RCL implementation (PYRCL).
+    # Replaces the legacy ctypes + libt32api shared-library plumbing.
+    "lauterbach-trace32-rcl>=1.1.5",
 ]
 
 [project.optional-dependencies]
