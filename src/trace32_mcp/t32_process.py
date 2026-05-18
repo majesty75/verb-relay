@@ -59,17 +59,38 @@ def supported_arches() -> list[str]:
     return sorted(ARCH_BINARIES.keys())
 
 
-def _host_triple() -> str:
-    """T32 ships per-host subdirs under bin/, e.g. mac64, pc_linux64, windows64."""
+def _host_triples() -> list[str]:
+    """T32 ships per-host subdirs under bin/. Names vary across releases:
+       * macOS:   macosx64 (current), mac64 (legacy)
+       * Linux:   pc_linux64 / pc_linux
+       * Windows: windows64 / windows
+    Return all plausible names in priority order; the first existing wins.
+    """
     sysname = platform.system()
     arch = platform.machine().lower()
     if sysname == "Darwin":
-        return "mac64"
+        return ["macosx64", "mac64"]
     if sysname == "Linux":
-        return "pc_linux64" if arch in ("x86_64", "amd64") else "pc_linux"
+        return ["pc_linux64", "pc_linux"] if arch in ("x86_64", "amd64") else ["pc_linux"]
     if sysname == "Windows":
-        return "windows64" if arch in ("amd64", "x86_64") else "windows"
+        return ["windows64", "windows"] if arch in ("amd64", "x86_64") else ["windows"]
     raise RuntimeError(f"unsupported host: {sysname} / {arch}")
+
+
+def _binary_variants(bin_name: str) -> list[str]:
+    """T32 binary may carry an OS-specific suffix:
+       * macOS:   t32marm-qt   (Qt GUI build, current)
+       * Linux:   t32marm-qt / t32marm
+       * Windows: t32marm.exe
+    Return candidate filenames in priority order.
+    """
+    sysname = platform.system()
+    if sysname == "Windows":
+        return [bin_name + ".exe"]
+    if sysname == "Darwin":
+        return [bin_name + "-qt", bin_name]
+    # Linux: modern installs ship -qt build alongside the legacy plain one
+    return [bin_name + "-qt", bin_name]
 
 
 def find_t32_binary(arch: str, t32sys: str | os.PathLike | None = None) -> Path:
@@ -77,8 +98,7 @@ def find_t32_binary(arch: str, t32sys: str | os.PathLike | None = None) -> Path:
     bin_name = ARCH_BINARIES.get(arch.lower())
     if bin_name is None:
         raise ValueError(f"unknown arch {arch!r}. Supported: {supported_arches()}")
-    if platform.system() == "Windows":
-        bin_name += ".exe"
+    variants = _binary_variants(bin_name)
 
     roots: list[Path] = []
     if t32sys:
@@ -94,23 +114,28 @@ def find_t32_binary(arch: str, t32sys: str | os.PathLike | None = None) -> Path:
         Path("C:\\T32"),
     ])
 
+    triples = _host_triples()
     for root in roots:
-        # Standard layout: <root>/bin/<host_triple>/<binary>
-        candidate = root / "bin" / _host_triple() / bin_name
-        if candidate.exists():
-            return candidate
-        # Some installs flatten to <root>/bin/<binary>
-        candidate = root / "bin" / bin_name
-        if candidate.exists():
-            return candidate
+        for triple in triples:
+            for variant in variants:
+                # Standard layout: <root>/bin/<host_triple>/<binary>
+                candidate = root / "bin" / triple / variant
+                if candidate.exists():
+                    return candidate
+        for variant in variants:
+            # Some installs flatten to <root>/bin/<binary>
+            candidate = root / "bin" / variant
+            if candidate.exists():
+                return candidate
 
     # Fall back to PATH lookup
-    on_path = shutil.which(bin_name)
-    if on_path:
-        return Path(on_path)
+    for variant in variants:
+        on_path = shutil.which(variant)
+        if on_path:
+            return Path(on_path)
     raise FileNotFoundError(
-        f"could not find {bin_name}. Set $T32SYS to a TRACE32 installation, "
-        f"or put {bin_name} on $PATH."
+        f"could not find any of {variants}. Set $T32SYS to a TRACE32 installation, "
+        f"or put one of those binaries on $PATH."
     )
 
 
@@ -138,6 +163,33 @@ def is_port_open(host: str, port: int, timeout: float = 0.3) -> bool:
             return True
     except OSError:
         return False
+
+
+def _find_pid_holding_port(port: int) -> int | None:
+    """Return the PID of the process listening on TCP `port`, or None.
+
+    Used on macOS where the Qt-built TRACE32 forks: the parent we spawned
+    exits with rc=0 within ~1s and the actual debugger lives in a detached
+    child. Without adopting that child, t32_shutdown can't terminate it.
+    """
+    if platform.system() == "Windows":
+        # Windows TRACE32 doesn't double-fork — proc.pid is authoritative.
+        return None
+    try:
+        out = subprocess.check_output(
+            ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"],
+            stderr=subprocess.DEVNULL,
+            timeout=2.0,
+        ).decode().strip()
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
+            FileNotFoundError, OSError):
+        return None
+    if not out:
+        return None
+    try:
+        return int(out.splitlines()[0])
+    except (ValueError, IndexError):
+        return None
 
 
 def is_rcl_responsive(host: str, port: int, t32sys: str | None = None,
@@ -597,20 +649,32 @@ def spawn(
 
     # Wait for the RCL port. NOTE: RCL=NETASSIST is UDP — we must probe with the
     # actual RCL handshake, not a TCP connect (which would always false-negative).
+    #
+    # macOS-specific: the Qt-built TRACE32 forks. The parent we spawned exits
+    # with rc=0 within ~1s and the real debugger runs as a detached child.
+    # We treat a clean parent exit as "keep polling for the child" and adopt
+    # the child PID via port lookup once RCL responds. A non-zero parent exit
+    # is still a hard failure (real crash).
     deadline = time.time() + timeout_seconds
+    parent_exited_clean = False
+    rcl_up = False
     while time.time() < deadline:
-        if proc.poll() is not None:
-            log_fh.close()
-            raise RuntimeError(
-                f"TRACE32 binary exited early (rc={proc.returncode}). "
-                f"Log tail:\n{Path(log_path).read_text(errors='replace')[-2000:]}"
-            )
+        rc = proc.poll()
+        if rc is not None:
+            if rc != 0 and not parent_exited_clean:
+                log_fh.close()
+                raise RuntimeError(
+                    f"TRACE32 binary exited early (rc={rc}). "
+                    f"Log tail:\n{Path(log_path).read_text(errors='replace')[-2000:]}"
+                )
+            parent_exited_clean = True
         # Real RCL handshake (UDP) — TCP probe would always false-negative here.
         if is_rcl_responsive("127.0.0.1", chosen_port, t32sys=str(binary.parent.parent.parent),
                              timeout_per_try=0.5):
+            rcl_up = True
             break
         time.sleep(0.3)
-    else:
+    if not rcl_up:
         _terminate(proc.pid)
         log_fh.close()
         # Surface as much context as possible so the AI / user can diagnose:
@@ -654,12 +718,21 @@ def spawn(
 
     log_fh.close()
 
+    # macOS Qt build forks; adopt the real listener PID so shutdown can
+    # actually terminate the debugger. On Linux/Windows proc.pid is correct
+    # and the lookup is best-effort.
+    adopted_pid = proc.pid
+    if parent_exited_clean:
+        listener_pid = _find_pid_holding_port(chosen_port)
+        if listener_pid:
+            adopted_pid = listener_pid
+
     inst = T32Instance(
         node_name=node,
         host="127.0.0.1",
         port=chosen_port,
         arch=arch,
-        pid=proc.pid,
+        pid=adopted_pid,
         binary=str(binary),
         config_path=str(config_path),
         log_path=str(log_path),

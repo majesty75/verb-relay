@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
+from ..presets import get_preset, list_presets
 from ..session import all_instances, ensure_instance, shutdown_instance
 from ..t32_process import SUPPORTED_BACKENDS, registry, render_config_t32, supported_arches
 
@@ -72,6 +73,15 @@ class SpawnInput(BaseModel):
         default=45.0, ge=5.0, le=300.0,
         description="How long to wait for the RCL port to open after spawn. Bump for slow Windows boxes / hardware boot.",
     )
+    preset: str | None = Field(
+        default=None,
+        description=(
+            "Optional named target preset (call t32_list_presets to enumerate). "
+            "If given, the preset's `arch`, `backend`, and `startup_script` are "
+            "applied as defaults — any explicit field on this call still wins. "
+            "USE THIS when you're not confident composing PRACTICE by hand."
+        ),
+    )
 
 
 class ShutdownInput(BaseModel):
@@ -107,25 +117,68 @@ class RenderConfigInput(BaseModel):
 
 def t32_spawn(args: dict) -> dict:
     p = SpawnInput(**args)
+
+    # Apply preset *as defaults* — explicit fields on the call win. This
+    # lets the AI pick a known-good config by name and still override the
+    # CPU / port / node_name when needed.
+    arch = p.arch
+    backend = p.backend
+    startup_script = p.startup_script
+    preset_applied: dict | None = None
+    if p.preset:
+        preset = get_preset(p.preset)
+        if preset is None:
+            return {
+                "ok": False,
+                "error": f"unknown preset {p.preset!r}",
+                "hint": "call t32_list_presets to see available names",
+            }
+        preset_applied = preset.to_dict()
+        # Apply only fields the caller didn't explicitly set.
+        # `arch`/`backend` have non-None defaults in pydantic, so we treat
+        # "still the default" as "not explicitly set" via a sentinel check.
+        if "arch" not in args or args.get("arch") is None:
+            arch = preset.arch
+        if "backend" not in args or args.get("backend") is None:
+            backend = preset.backend
+        if startup_script is None:
+            startup_script = preset.startup_script
+
     try:
         inst, _client = ensure_instance(
             port=p.port,
             node_name=p.node_name,
-            arch=p.arch,
+            arch=arch,
             t32sys=p.t32sys,
             auto_spawn=True,
             headless=p.headless,
-            backend=p.backend,
+            backend=backend,
             target_host=p.target_host,
             target_node=p.target_node,
             proxy_port=p.proxy_port,
             extra_config=p.extra_config,
-            startup_script=p.startup_script,
+            startup_script=startup_script,
             timeout_seconds=p.timeout_seconds,
         )
     except Exception as e:
-        return {"ok": False, "error": str(e), "error_type": type(e).__name__}
-    return {"ok": True, "instance": inst.to_dict()}
+        return {"ok": False, "error": str(e), "error_type": type(e).__name__,
+                "preset_applied": preset_applied}
+    out: dict = {"ok": True, "instance": inst.to_dict()}
+    if preset_applied:
+        out["preset_applied"] = preset_applied
+    return out
+
+
+class ListPresetsInput(BaseModel):
+    """No arguments."""
+
+
+def t32_list_presets(_args: dict) -> dict:
+    """List curated TRACE32 target presets. Use the `name` of any entry
+    as the `preset=` argument to `t32_spawn` to get a known-good `arch` +
+    `backend` + `startup_script` combination.
+    """
+    return {"ok": True, "presets": list_presets()}
 
 
 def t32_list_instances(_args: dict) -> dict:

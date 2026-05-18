@@ -237,8 +237,18 @@ class T32Client:
 
     # ---- core verb ----------------------------------------------------------
 
-    def run(self, line: str) -> CommandResult:
-        """Run one PRACTICE command line and return a typed result."""
+    def run(self, line: str, *, capture_area: bool = True) -> CommandResult:
+        """Run one PRACTICE command line and return a typed result.
+
+        Output capture:
+          * `get_message()` returns the LAST POPUP, not the AREA log. Many
+            commands don't pop a message, so it returns stale text from a
+            previous popup. We treat that as advisory only.
+          * When `capture_area=True` we clear MCPLOG before, run the command,
+            then read MCPLOG after — that's what gives the AI the actual
+            PRINT/echo/error output of the command. AREA capture costs an
+            extra round-trip so callers can disable it for tight loops.
+        """
         with self._lock:
             try:
                 self._ensure_connected()
@@ -247,7 +257,14 @@ class T32Client:
                     ok=False, cmd=line, text="", mode=0, mode_flags=[],
                     practice_state=0, error=f"connect failed: {e}",
                 )
-            text = ""
+            # Clear AREA so output of THIS command isn't mixed with previous.
+            if capture_area:
+                try:
+                    self._dbg.cmd("AREA.CLEAR MCPLOG")
+                except Exception:
+                    pass
+            popup_text = ""
+            area_text = ""
             mode = 0
             pstate = 0
             err: str | None = None
@@ -255,22 +272,29 @@ class T32Client:
                 self._dbg.cmd(line)
             except Exception as e:
                 err = f"cmd raised: {e}"
-            # Pull the AREA message + PRACTICE state regardless of the cmd outcome.
+            # Pull popup + practice state (always cheap).
             try:
                 msg = self._dbg.get_message()
-                # PYRCL's get_message() returns either a string or a (text, mode) tuple
-                # depending on version — handle both.
                 if isinstance(msg, tuple) and len(msg) >= 2:
-                    text, mode = str(msg[0]), int(msg[1])
+                    popup_text, mode = str(msg[0]), int(msg[1])
                 else:
-                    text = "" if msg is None else str(msg)
+                    popup_text = "" if msg is None else str(msg)
             except Exception:
                 pass
             try:
-                pstate = int(self._dbg.get_practice_state())
+                # PRACTICE.STATE() returns 0=idle, 1=run, 2=error per
+                # general_func.pdf. PYRCL has no direct accessor — go via fnc.
+                pstate = int(self._dbg.fnc("PRACTICE.STATE()"))
             except Exception:
-                pass
+                pstate = 0  # unknown — don't false-fail because we couldn't ask
+            # Capture AREA output of this specific command.
+            if capture_area and err is None:
+                try:
+                    area_text = self._read_area_inline("MCPLOG")
+                except Exception:
+                    pass
             ok = (err is None) and (not (mode & ERROR_MASK)) and (pstate != PRACTICE_ERR)
+            text = area_text or popup_text  # prefer AREA (cmd-scoped) over popup (global)
             if not ok and err is None:
                 err = text.strip() or (
                     f"mode={decode_mode(mode)} practice_state={pstate}"
@@ -281,6 +305,36 @@ class T32Client:
                 practice_state=pstate, error=err,
             )
 
+    def _read_area_inline(self, area: str = "MCPLOG") -> str:
+        """Read the named AREA via AREA.SAVE → tempfile (caller holds the lock).
+
+        Only useful when MCP and TRACE32 share a filesystem. Returns "" if
+        no shared FS (remote PowerDebug).
+        """
+        import tempfile, time as _time
+        from pathlib import Path as _P
+        tmp = _P(tempfile.gettempdir()) / f"trace32_mcp_area_{area}.txt"
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+        try:
+            self._dbg.cmd(f'AREA.SAVE "{tmp.as_posix()}" {area}')
+        except Exception:
+            return ""
+        for _ in range(20):
+            if tmp.exists():
+                break
+            _time.sleep(0.025)
+        if not tmp.exists():
+            return ""
+        try:
+            txt = tmp.read_text(errors="replace")
+        finally:
+            try: tmp.unlink()
+            except OSError: pass
+        return txt
+
     # Back-compat aliases
     def cmd(self, line: str) -> CommandResult:
         return self.run(line)
@@ -289,7 +343,28 @@ class T32Client:
         return self.run(line).to_dict()
 
     def eval_practice(self, expression: str) -> dict:
-        return self.run(f"PRINT {expression}").to_dict()
+        """Evaluate a PRACTICE expression via PYRCL's fnc() — returns the
+        real value, not a stringified popup. Falls back to PRINT+AREA capture
+        if fnc raises (some expressions aren't valid `fnc()` inputs).
+        """
+        with self._lock:
+            self._ensure_connected()
+            try:
+                value = self._dbg.fnc(expression)
+                return {
+                    "ok": True, "expression": expression,
+                    "value": value if isinstance(value, (int, float, str, bool, type(None)))
+                             else repr(value),
+                    "value_type": type(value).__name__,
+                    "method": "fnc",
+                }
+            except Exception as e:
+                # Fall through to PRINT path
+                fnc_err = str(e)
+        res = self.run(f"PRINT {expression}").to_dict()
+        res["fnc_error"] = fnc_err
+        res["method"] = "print"
+        return res
 
     # ---- state --------------------------------------------------------------
 
@@ -322,22 +397,164 @@ class T32Client:
 
     # ---- memory -------------------------------------------------------------
 
+    def _addr(self, address: int, access: str = "ANY"):
+        """Build a PYRCL Address from (int, access-class-string).
+
+        PYRCL's address.from_string parses things like "D:0x100", "P:0x100".
+        ANY → no access prefix.
+        """
+        access = (access or "ANY").upper()
+        prefix = "" if access in ("", "ANY") else f"{access}:"
+        return self._dbg.address.from_string(f"{prefix}0x{address:X}")
+
     def read_memory(self, address: int, length: int, access: str = "ANY") -> bytes:
         with self._lock:
             self._ensure_connected()
-            try:
-                return bytes(self._dbg.memory.read(address=address, length=length, access=access))
-            except AttributeError:
-                # Older PYRCL: positional API
-                return bytes(self._dbg.memory_read(address, length, access))
+            addr = self._addr(address, access)
+            return bytes(self._dbg.memory.read(addr, length=length))
 
     def write_memory(self, address: int, data: bytes, access: str = "ANY") -> None:
         with self._lock:
             self._ensure_connected()
+            addr = self._addr(address, access)
+            self._dbg.memory.write(addr, bytes(data))
+
+    # ---- registers ----------------------------------------------------------
+
+    def read_registers(self) -> list[dict]:
+        """Read all CPU registers via PYRCL's native register.read_all().
+
+        Returns a list of {name, value, unit, core} dicts.
+        """
+        with self._lock:
+            self._ensure_connected()
+            regs = self._dbg.register.read_all()
+            out = []
+            for r in regs:
+                out.append({
+                    "name":  getattr(r, "name", None),
+                    "value": getattr(r, "value", None),
+                    "unit":  getattr(r, "unit", None),
+                    "core":  getattr(r, "core", None),
+                })
+            return out
+
+    def read_register(self, name: str) -> dict:
+        with self._lock:
+            self._ensure_connected()
+            r = self._dbg.register.read(name)
+            return {
+                "name":  getattr(r, "name", name),
+                "value": getattr(r, "value", None),
+                "unit":  getattr(r, "unit", None),
+                "core":  getattr(r, "core", None),
+            }
+
+    def write_register(self, name: str, value: int) -> None:
+        with self._lock:
+            self._ensure_connected()
+            self._dbg.register.write_by_name(name, int(value))
+
+    # ---- symbols ------------------------------------------------------------
+
+    def symbol_query(self, name: str) -> dict | None:
+        """Look up a single symbol by name. Returns None if not found."""
+        with self._lock:
+            self._ensure_connected()
             try:
-                self._dbg.memory.write(address=address, data=bytes(data), access=access)
-            except AttributeError:
-                self._dbg.memory_write(address, bytes(data), access)
+                s = self._dbg.symbol.query_by_name(name)
+            except Exception:
+                return None
+            if s is None:
+                return None
+            return {
+                "name":    getattr(s, "name", name),
+                "address": getattr(getattr(s, "address", None), "value", None),
+                "size":    getattr(s, "size", None),
+                "type":    getattr(s, "type", None) and str(s.type),
+            }
+
+    def symbol_list(self, pattern: str = "*", limit: int = 200) -> list[dict]:
+        """Glob-style symbol listing.
+
+        PYRCL's `symbol` service only exposes `query_by_name`, no glob walker.
+        Fall back to a PRACTICE pipeline that writes one symbol per line to a
+        temp file via sYmbol.LIST (output goes to AREA → we save+parse).
+        """
+        with self._lock:
+            self._ensure_connected()
+            try:
+                self._dbg.cmd("AREA.CLEAR MCPLOG")
+                # sYmbol.List is a window; for inline output use sYmbol.List.*
+                # Use Function listing which AREAs the names.
+                self._dbg.cmd(f"sYmbol.List.Function {pattern}")
+            except Exception as e:
+                return [{"_error": f"sYmbol.List.Function failed: {e}"}]
+            txt = self._read_area_inline("MCPLOG")
+        # Best-effort line parse: each non-empty token-line is a candidate name.
+        out = []
+        for line in txt.splitlines():
+            line = line.strip()
+            if not line or line.startswith(";"):
+                continue
+            tokens = line.split()
+            if tokens:
+                out.append({"raw": line, "name": tokens[0]})
+            if len(out) >= limit:
+                break
+        return out
+
+    # ---- breakpoints --------------------------------------------------------
+
+    def bp_list(self) -> list[dict]:
+        with self._lock:
+            self._ensure_connected()
+            try:
+                bps = self._dbg.breakpoint.list()
+            except Exception as e:
+                return [{"_error": str(e)}]
+            out = []
+            for b in bps:
+                out.append({
+                    "address": getattr(getattr(b, "address", None), "value", None),
+                    "type":    str(getattr(b, "type_", getattr(b, "type", None))),
+                    "impl":    str(getattr(b, "impl", None)),
+                    "enabled": getattr(b, "enabled", None),
+                    "core":    getattr(b, "core", None),
+                })
+            return out
+
+    # ---- execution (native PYRCL — preferred over `Go`/`Break` PRACTICE) ----
+
+    def native_go(self):
+        with self._lock:
+            self._ensure_connected()
+            self._dbg.go()
+
+    def native_break(self):
+        with self._lock:
+            self._ensure_connected()
+            self._dbg.break_()
+
+    def native_step(self):
+        with self._lock:
+            self._ensure_connected()
+            self._dbg.step()
+
+    def native_step_over(self):
+        with self._lock:
+            self._ensure_connected()
+            self._dbg.step_over()
+
+    def native_step_asm(self):
+        with self._lock:
+            self._ensure_connected()
+            self._dbg.step_asm()
+
+    def native_go_return(self):
+        with self._lock:
+            self._ensure_connected()
+            self._dbg.go_return()
 
     # ---- AREA log -----------------------------------------------------------
 

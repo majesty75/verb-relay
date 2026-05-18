@@ -70,6 +70,12 @@ TOOLS: list[tuple[str, str, Callable[[dict], dict], Any]] = [
         "Dry-run: return the literal config.t32 that t32_spawn would write, without actually spawning. "
         "Use this when you suspect TRACE32 isn't binding the RCL port and want to inspect the planned config first.",
         inst.t32_render_config, inst.RenderConfigInput),
+    ("t32_list_presets",
+        "List curated target presets (cortexm3-sim, stm32h743-swd, ...). "
+        "Each entry bundles a known-good (arch, backend, startup_script) combo. "
+        "Pass `preset=<name>` to t32_spawn instead of composing PRACTICE by hand — "
+        "best path for weaker models that struggle with TRACE32 syntax.",
+        inst.t32_list_presets, inst.ListPresetsInput),
     ("t32_healthcheck",
         "Battery of readiness checks — TCP open, RCL handshake, state query, echo command, AREA log readable. "
         "Returns per-step pass/fail + latency. Use before kicking off long automation to be sure TRACE32 is responsive.",

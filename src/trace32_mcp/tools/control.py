@@ -1,4 +1,10 @@
-"""Execution control + breakpoints."""
+"""Execution control + breakpoints.
+
+Uses PYRCL's native go()/break_()/step() etc. instead of PRACTICE commands
+so we get back proper Python exceptions on failure (and avoid the stale-
+popup output capture problem). Breakpoint listing also goes through the
+structured breakpoint service.
+"""
 
 from __future__ import annotations
 
@@ -7,13 +13,15 @@ from pydantic import Field
 from ._common import TargetSelector, resolve_target
 
 
-_CONTROL_CMD = {
-    "run":       "Go",
-    "halt":      "Break",
-    "step":      "Step",
-    "step_over": "Step.Over",
-    "step_out":  "Step.Out",
-    "step_asm":  "Step.Asm",
+# Maps action → (native method on T32Client, fallback PRACTICE command).
+# Native methods raise on failure; PRACTICE fallback always returns a result.
+_CONTROL = {
+    "run":       ("native_go",         "Go"),
+    "halt":      ("native_break",      "Break"),
+    "step":      ("native_step",       "Step"),
+    "step_over": ("native_step_over",  "Step.Over"),
+    "step_out":  ("native_go_return",  "Step.Out"),
+    "step_asm":  ("native_step_asm",   "Step.Asm"),
 }
 
 _BP_TYPE = {
@@ -25,7 +33,7 @@ _BP_TYPE = {
 
 
 class ControlInput(TargetSelector):
-    action: str = Field(description=f"One of {sorted(_CONTROL_CMD.keys())}")
+    action: str = Field(description=f"One of {sorted(_CONTROL.keys())}")
 
 
 class BreakpointInput(TargetSelector):
@@ -42,12 +50,22 @@ class BreakpointInput(TargetSelector):
 
 def t32_control(args: dict) -> dict:
     p = ControlInput(**args)
-    if p.action not in _CONTROL_CMD:
-        return {"ok": False, "error": f"action must be one of {sorted(_CONTROL_CMD)}, got {p.action}"}
+    if p.action not in _CONTROL:
+        return {"ok": False, "error": f"action must be one of {sorted(_CONTROL)}, got {p.action}"}
     _inst, client = resolve_target(p)
-    cmd = _CONTROL_CMD[p.action]
-    res = client.run(cmd).to_dict()
-    return {"ok": res["ok"], "action": p.action, "cmd": cmd, "result": res, "target": client.state()}
+    native, fallback = _CONTROL[p.action]
+    err: str | None = None
+    try:
+        getattr(client, native)()
+    except Exception as e:
+        err = f"native {native}() raised: {e}; falling back to PRACTICE {fallback!r}"
+        # Fall back to plain PRACTICE
+        res = client.run(fallback).to_dict()
+        return {"ok": res["ok"], "action": p.action, "cmd": fallback,
+                "method": "practice_fallback", "result": res,
+                "warning": err, "target": client.state()}
+    return {"ok": True, "action": p.action, "cmd": native,
+            "method": "native", "target": client.state()}
 
 
 def t32_breakpoint(args: dict) -> dict:
@@ -56,9 +74,13 @@ def t32_breakpoint(args: dict) -> dict:
     action = p.action.lower()
 
     if action == "list":
-        return {"ok": True, "action": action, "result": client.run("Break.List").to_dict()}
+        bps = client.bp_list()
+        if bps and isinstance(bps[0], dict) and "_error" in bps[0]:
+            return {"ok": False, "action": action, "error": bps[0]["_error"]}
+        return {"ok": True, "action": action, "count": len(bps), "breakpoints": bps}
     if action == "clear_all":
-        return {"ok": True, "action": action, "result": client.run("Break.Delete").to_dict()}
+        res = client.run("Break.Delete").to_dict()
+        return {"ok": res["ok"], "action": action, "result": res}
 
     if not p.location:
         return {"ok": False, "error": f"action={action} requires `location`"}

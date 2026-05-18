@@ -52,9 +52,20 @@ def get_client(
 ) -> T32Client:
     """Get a cached T32Client for the given endpoint.
 
-    Does NOT spawn. Assumes the endpoint already exists; callers that want
-    spawn-if-missing should use `ensure_instance()`.
+    Resolution order:
+      1. If `node_name` is given but no host/port: look up the registry and
+         use the registered endpoint. This is what callers expect — `t32_status
+         node_name=foo` shouldn't try `127.0.0.1:20000` just because the
+         caller didn't repeat the host/port already in the registry.
+      2. Otherwise build an endpoint from defaults + the supplied args.
+    Does NOT spawn. Callers that want spawn-if-missing should use
+    `ensure_instance()`.
     """
+    if node_name and host is None and port is None:
+        inst = registry().get_by_node(node_name)
+        if inst is not None:
+            host = inst.host
+            port = inst.port
     ep = _endpoint(host, port, node_name, t32sys)
     key = (ep.host, ep.port, ep.node_name)
     with _CLIENT_LOCK:

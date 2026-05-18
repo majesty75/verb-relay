@@ -103,32 +103,41 @@ def t32_healthcheck(args: dict) -> dict:
         checks.append({"name": "state_query", "ok": False, "latency_ms": _ms(t0), "error": str(e)})
         return {"ok": False, "instance": inst.to_dict(), "checks": checks}
 
-    # 4. Trivial command echo (PRINT)
+    # 4. Trivial command echo (PRINT). "ok" means PRACTICE ran without an
+    # error flag — we do NOT require the echo string to appear in `text`,
+    # because TRACE32 may return TARGET_INFO popups (e.g. "Floating license
+    # gets checked on first Go or Step") even when PRACTICE succeeded.
     t0 = time.perf_counter()
     try:
         res = client.run(p.probe).to_dict()
-        echo_ok = res.get("ok", False) and "trace32-mcp" in (res.get("text") or "")
+        echo_ok = res.get("ok", False)
+        echo_found = "trace32-mcp" in (res.get("text") or "")
         checks.append({
             "name": "echo_command",
             "ok": echo_ok,
             "latency_ms": _ms(t0),
             "cmd": p.probe,
             "text": (res.get("text") or "")[:200],
+            "echo_string_found": echo_found,
             "mode_flags": res.get("mode_flags", []),
             "practice_state": res.get("practice_state"),
         })
     except Exception as e:
         checks.append({"name": "echo_command", "ok": False, "latency_ms": _ms(t0), "error": str(e)})
 
-    # 5. AREA log scrape — confirms MCPLOG is wired up
+    # 5. AREA log scrape — confirms MCPLOG is wired up. "Empty" is OK as long
+    # as the AREA.SAVE round-trip succeeded; we record the size as evidence.
     t0 = time.perf_counter()
     try:
         area_text = client.read_area_log("MCPLOG", lines=5)
         checks.append({
             "name": "area_log_readable",
-            "ok": bool(area_text),
+            # Round-trip worked → True even if empty (a freshly cleared AREA
+            # is the expected state right after MCPLOG setup).
+            "ok": True,
             "latency_ms": _ms(t0),
             "preview": area_text[-200:] if area_text else "",
+            "empty": not bool(area_text),
         })
     except Exception as e:
         checks.append({"name": "area_log_readable", "ok": False, "latency_ms": _ms(t0), "error": str(e)})
