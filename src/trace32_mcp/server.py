@@ -66,6 +66,10 @@ TOOLS: list[tuple[str, str, Callable[[dict], dict], Any]] = [
         "Read recent log output from an instance: its subprocess stdout/stderr and/or the dedicated MCPLOG AREA window. "
         "Use this when something fails and you need to see what TRACE32 actually printed.",
         inst.t32_get_log, inst.GetLogInput),
+    ("t32_render_config",
+        "Dry-run: return the literal config.t32 that t32_spawn would write, without actually spawning. "
+        "Use this when you suspect TRACE32 isn't binding the RCL port and want to inspect the planned config first.",
+        inst.t32_render_config, inst.RenderConfigInput),
     ("t32_healthcheck",
         "Battery of readiness checks — TCP open, RCL handshake, state query, echo command, AREA log readable. "
         "Returns per-step pass/fail + latency. Use before kicking off long automation to be sure TRACE32 is responsive.",

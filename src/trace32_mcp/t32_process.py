@@ -143,37 +143,67 @@ OS=
 ID=T32_{node}
 TMP={tmp_path}
 
-PBI=SIM
+PBI=
+SIM
 
 RCL=NETASSIST
 PORT={port}
 PACKLEN={packlen}
 
-; Force a dedicated AREA so the MCP can scrape all command output
-; (this is replayed at session-connect time via 'AREA.CREATE MCPLOG' as well)
 SCREEN=
 HEADER=Trace32-MCP {node}
 """
+# Notes on the canonical config.t32 layout above:
+#   * Each section is `KEY=` on its own line followed by section content on the
+#     NEXT line. Some sections (RCL, SCREEN) take the value on the same line,
+#     but PBI / OS / SCREEN historically use the next-line form across versions.
+#   * `PBI=` then `SIM` enables the instruction-set simulator backend. Writing
+#     `PBI=SIM` on a single line silently produces a no-backend launch on some
+#     TRACE32 builds — the GUI opens but RCL is never armed.
+#   * Sections are separated by blank lines.
 
 
-def write_config_t32(dst_dir: Path, *, port: int, node: str, packlen: int = 1024) -> Path:
+def write_config_t32(
+    dst_dir: Path,
+    *,
+    port: int,
+    node: str,
+    packlen: int = 1024,
+    extra_config: str | None = None,
+) -> Path:
     """Generate a TRACE32 config.t32 in dst_dir.
 
-    The TMP= line uses the OS-native temp dir (so this works on Windows
-    where /tmp doesn't exist). TRACE32 needs a forward-slash path even on
-    Windows — convert here so the generated config is unambiguous.
+    `extra_config` is appended verbatim after the standard sections (useful
+    for arch-specific CPU= lines, license file paths, custom AREA defaults, ...).
+    Cross-platform: TMP= uses the OS-native temp dir, emitted as a forward-slash
+    path which TRACE32 accepts on every host.
     """
     import tempfile as _tf
     dst_dir.mkdir(parents=True, exist_ok=True)
-    # TRACE32 historically prefers forward-slash paths in config.t32 on every host.
     tmp_path = Path(_tf.gettempdir()).as_posix()
-    cfg = dst_dir / "config.t32"
-    cfg.write_text(
-        CONFIG_T32_TEMPLATE.format(
-            port=port, node=node, packlen=packlen, tmp_path=tmp_path,
-        )
+    body = CONFIG_T32_TEMPLATE.format(
+        port=port, node=node, packlen=packlen, tmp_path=tmp_path,
     )
+    if extra_config:
+        body += "\n" + extra_config.rstrip() + "\n"
+    cfg = dst_dir / "config.t32"
+    cfg.write_text(body)
     return cfg
+
+
+def render_config_t32(*, port: int = 20000, node: str = "T32", packlen: int = 1024,
+                      extra_config: str | None = None) -> str:
+    """Return the config.t32 contents that would be written for a given spawn,
+    without touching the filesystem. Useful for AI agents to sanity-check
+    the planned config before invoking t32_spawn."""
+    import tempfile as _tf
+    tmp_path = Path(_tf.gettempdir()).as_posix()
+    body = CONFIG_T32_TEMPLATE.format(
+        port=port, node=node, packlen=packlen, tmp_path=tmp_path,
+    )
+    if extra_config:
+        body += "\n" + extra_config.rstrip() + "\n"
+    return body
 
 
 # --- instance dataclass + registry ------------------------------------------
@@ -362,10 +392,14 @@ def spawn(
     t32sys: str | None = None,
     headless: bool = False,
     extra_args: list[str] | None = None,
-    timeout_seconds: float = 20.0,
+    extra_config: str | None = None,
+    timeout_seconds: float = 45.0,
 ) -> T32Instance:
     """Launch a TRACE32 PowerView/simulator process and wait for its RCL port.
 
+    `extra_config` is appended to the generated config.t32 (use for CPU= picks,
+    license paths, custom AREA defaults).
+    `extra_args` is appended to the binary argv.
     Raises SpawnTimeout if the process is up but the port never responds.
     In fake mode (T32_MCP_FAKE=1) returns a registered fake instance without
     launching anything.
@@ -382,7 +416,9 @@ def spawn(
     node = node_name or f"T32_{arch.upper()}_{chosen_port}"
 
     work_dir = Path(tempfile.mkdtemp(prefix=f"trace32_mcp_{node}_"))
-    config_path = write_config_t32(work_dir, port=chosen_port, node=node)
+    config_path = write_config_t32(
+        work_dir, port=chosen_port, node=node, extra_config=extra_config,
+    )
     log_path = work_dir / "t32.log"
 
     argv: list[str] = [str(binary), "-c", str(config_path)]
@@ -424,10 +460,32 @@ def spawn(
     else:
         _terminate(proc.pid)
         log_fh.close()
+        # Surface as much context as possible so the AI / user can diagnose:
+        # the config we wrote (TRACE32 may have rejected it silently) and the
+        # tail of stdout/stderr (TRACE32 sometimes logs config errors to stderr).
+        try:
+            log_tail = Path(log_path).read_text(errors='replace')[-2000:]
+        except Exception:
+            log_tail = "(no log captured)"
+        try:
+            cfg_text = Path(config_path).read_text(errors='replace')
+        except Exception:
+            cfg_text = "(config unreadable)"
         raise SpawnTimeout(
-            f"TRACE32 spawned (pid={proc.pid}) but port {chosen_port} never opened "
-            f"within {timeout_seconds}s. Log tail:\n"
-            f"{Path(log_path).read_text(errors='replace')[-2000:]}"
+            f"TRACE32 spawned (pid={proc.pid}) but port {chosen_port} never "
+            f"opened within {timeout_seconds}s.\n\n"
+            f"--- generated config.t32 ({config_path}) ---\n{cfg_text}\n"
+            f"--- TRACE32 stdout/stderr tail ({log_path}) ---\n{log_tail}\n"
+            f"--- diagnostic checklist ---\n"
+            f"  * The GUI opening but RCL not binding usually means TRACE32 read\n"
+            f"    the config but rejected the PBI/RCL section. Verify the layout\n"
+            f"    matches Lauterbach's standard form (PBI= on its own line, value\n"
+            f"    on the next line).\n"
+            f"  * Some CPUs need an explicit CPU= line under the SYSTEM section.\n"
+            f"    Pass `extra_config` to t32_spawn to inject it.\n"
+            f"  * On Windows, Defender Firewall can silently block bind on a new\n"
+            f"    port the first time PowerView runs. Allow inbound on the\n"
+            f"    TRACE32 executable and retry.\n"
         )
 
     log_fh.close()

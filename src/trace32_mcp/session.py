@@ -74,12 +74,16 @@ def ensure_instance(
     t32sys: str | None = None,
     auto_spawn: bool = True,
     headless: bool = False,
+    extra_config: str | None = None,
+    timeout_seconds: float = 45.0,
 ) -> tuple[T32Instance, T32Client]:
     """Spawn-or-attach an instance and return both the registry record and a client.
 
     If `auto_spawn=False`, only attach to an already-running T32 (raises if
     nothing is listening).
     """
+    from .t32_process import spawn as spawn_t32
+
     cfg = load_config()
     target_host = host or cfg.host
     target_port = port  # None means "any free port" (only honored when spawning)
@@ -87,13 +91,16 @@ def ensure_instance(
     if target_port is not None and is_port_open(target_host, target_port):
         inst = attach(target_host, target_port, node_name=node_name, arch=arch)
     elif auto_spawn:
-        inst = connect_or_spawn(
+        # We call spawn() directly so we can pass extra_config + timeout_seconds.
+        # connect_or_spawn is the older convenience wrapper without those knobs.
+        inst = spawn_t32(
             arch=arch,
-            host=target_host,
             port=target_port,
             node_name=node_name,
             t32sys=t32sys or cfg.t32sys,
             headless=headless,
+            extra_config=extra_config,
+            timeout_seconds=timeout_seconds,
         )
     else:
         raise ConnectionError(
