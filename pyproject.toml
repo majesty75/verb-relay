@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trace32-mcp"
+version = "0.1.0"
+description = "Model Context Protocol server for Lauterbach TRACE32 PowerView / PowerDebug"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Trace32-MCP contributors" }]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Debuggers",
+]
+dependencies = [
+    "mcp>=1.2.0",
+    "pydantic>=2.7.0",
+    "numpy>=1.26.0",
+    "sqlite-vec>=0.1.6",
+    "sentence-transformers>=3.0.0",
+    "torch>=2.2.0",
+    "zstandard>=0.22.0",
+]
+
+[project.optional-dependencies]
+# Adds the ingest pipeline (PDF parsing + chunker + optional OCR) and the
+# `t32-rag` CLI. End users running the MCP server do NOT need these.
+build = [
+    "pymupdf>=1.24.0",
+    "tqdm>=4.66.0",
+    "click>=8.1.0",
+    "pytesseract>=0.3.10",  # needs the `tesseract` binary on PATH
+    "pillow>=10.0.0",
+]
+dev = ["pytest>=8.0", "ruff>=0.6.0"]
+
+[project.scripts]
+trace32-mcp = "trace32_mcp.server:main"
+t32-rag     = "trace32_mcp.manuals_build.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/REPLACE_ME/Trace32-MCP"
+Issues   = "https://github.com/REPLACE_ME/Trace32-MCP/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+trace32_mcp = ["py.typed", "db/*.db"]

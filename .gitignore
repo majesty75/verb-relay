@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local model cache
+.cache/
+
+# OS
+.DS_Store
+
+# Build artifacts
+build/
+dist/
+
+# Local config
+.env
+
+# Local ingest output / scratch dirs (use --shard-dir src/trace32_mcp/db for final build)
+shards_out/
+shards_v2/
+*.log
+
+# Egg-info regenerated on every install
+*.egg-info/
+
