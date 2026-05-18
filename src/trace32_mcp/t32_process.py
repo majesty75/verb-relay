@@ -518,14 +518,25 @@ def spawn(
     proxy_port: int = 8866,
     extra_args: list[str] | None = None,
     extra_config: str | None = None,
+    startup_script: str | None = None,
     timeout_seconds: float = 45.0,
 ) -> T32Instance:
     """Launch a TRACE32 PowerView (sim or PowerDebug) and wait for its RCL port.
 
     `arch` chooses the binary (t32marm, t32mppc, ...). `backend` chooses the
-    runtime PBI section (sim / usb / net / usb_proxy / custom). For 'net' or
-    'usb_proxy' supply `target_host`. For 'custom' provide the entire PBI
-    section via `extra_config` and leave backend='custom'.
+    runtime PBI section (sim / usb / net / usb_proxy / custom).
+
+    Two distinct "extras":
+      * `extra_config` — additional **config.t32** lines (e.g. `PRINTER=`,
+        `HEADER=`, custom `SCREEN=` settings). NOT for PRACTICE commands like
+        `SYStem.CPU` — those are runtime debugger commands and TRACE32 will
+        reject them as "wrong section" if put in config.t32.
+      * `startup_script` — inline **PRACTICE** body (.cmm content) to execute
+        after PowerView boots. The canonical mechanism for `SYStem.CPU
+        <name>`, `SYStem.MemAccess`, target-specific configuration, etc.
+        We write it to <work_dir>/startup.cmm and pass it to TRACE32 via
+        `-s <path>` (per installation.pdf p53-62, practice_user.pdf p15-16).
+
     Raises SpawnTimeout if the process starts but RCL never responds.
     In fake mode (T32_MCP_FAKE=1) returns a registered fake instance without
     launching anything.
@@ -554,6 +565,13 @@ def spawn(
     log_path = work_dir / "t32.log"
 
     argv: list[str] = [str(binary), "-c", str(config_path)]
+    if startup_script:
+        # TRACE32 runs autostart.cmm first, then this script. Per
+        # installation.pdf p53-62, this is the proper way to chain runtime
+        # PRACTICE setup (e.g. `SYStem.CPU CORTEXM4`, `SYStem.MemAccess DAP`).
+        startup_path = work_dir / "startup.cmm"
+        startup_path.write_text(startup_script.rstrip() + "\n")
+        argv += ["-s", str(startup_path)]
     if headless and platform.system() != "Windows":
         # T32 does not have a true headless mode, but we can hint at it on Linux
         argv += ["-nofbsync"]
@@ -624,8 +642,11 @@ def spawn(
             f"  * Windows Defender Firewall can silently block UDP bind on a\n"
             f"    new port the first time PowerView runs. Allow inbound UDP\n"
             f"    on the TRACE32 executable for the chosen port.\n"
-            f"  * Some CPUs need an explicit `SYStem.CPU <name>` line.\n"
-            f"    Pass `extra_config` to t32_spawn to inject it.\n"
+            f"  * For CPU-specific setup (`SYStem.CPU <name>`, `SYStem.MemAccess`,\n"
+            f"    `SYStem.CONFIG.*`), pass the PRACTICE body via `startup_script`\n"
+            f"    to t32_spawn — NOT via `extra_config` (those are PRACTICE\n"
+            f"    commands, not config.t32 directives; TRACE32 errors `wrong\n"
+            f"    section` if they end up in config.t32).\n"
             f"  * Run t32_render_config (with the same backend / target_host)\n"
             f"    first to dry-run the config and compare against working\n"
             f"    examples — see installation.pdf p42-47 via t32_search_manuals.\n"

@@ -50,9 +50,22 @@ class SpawnInput(BaseModel):
     extra_config: str | None = Field(
         default=None,
         description=(
-            "Optional extra config.t32 lines appended after the standard sections. Use for "
-            "`SYStem.CPU <name>`-style preconfig, license paths, or custom AREAs. With "
-            "backend='custom' this MUST contain the entire PBI section yourself."
+            "Optional extra **config.t32** lines appended after the standard sections. "
+            "ONLY for legitimate config.t32 directives (e.g. PRINTER=, custom SCREEN= "
+            "settings, license paths, additional sections). DO NOT use this for "
+            "PRACTICE commands like `SYStem.CPU` — those are runtime commands and "
+            "TRACE32 will reject them with 'wrong section'. Use `startup_script` "
+            "for PRACTICE. With backend='custom' you also supply the full PBI section here."
+        ),
+    )
+    startup_script: str | None = Field(
+        default=None,
+        description=(
+            "Optional inline **PRACTICE** script body (.cmm content) that runs "
+            "automatically after PowerView boots. This is the canonical mechanism for "
+            "`SYStem.CPU <name>`, `SYStem.MemAccess`, `SYStem.CONFIG.*`, target preconfig. "
+            "We write it to <work_dir>/startup.cmm and pass `-s <path>` to TRACE32 "
+            "(per installation.pdf p53-62, practice_user.pdf p15-16)."
         ),
     )
     timeout_seconds: float = Field(
@@ -107,6 +120,7 @@ def t32_spawn(args: dict) -> dict:
             target_node=p.target_node,
             proxy_port=p.proxy_port,
             extra_config=p.extra_config,
+            startup_script=p.startup_script,
             timeout_seconds=p.timeout_seconds,
         )
     except Exception as e:

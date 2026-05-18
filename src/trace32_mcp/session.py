@@ -79,6 +79,7 @@ def ensure_instance(
     target_node: str | None = None,
     proxy_port: int = 8866,
     extra_config: str | None = None,
+    startup_script: str | None = None,
     timeout_seconds: float = 45.0,
 ) -> tuple[T32Instance, T32Client]:
     """Spawn-or-attach an instance and return both the registry record and a client.
@@ -108,6 +109,7 @@ def ensure_instance(
             target_node=target_node,
             proxy_port=proxy_port,
             extra_config=extra_config,
+            startup_script=startup_script,
             timeout_seconds=timeout_seconds,
         )
     else:
