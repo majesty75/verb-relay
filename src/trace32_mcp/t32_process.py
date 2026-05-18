@@ -61,17 +61,26 @@ def supported_arches() -> list[str]:
 
 def _host_triples() -> list[str]:
     """T32 ships per-host subdirs under bin/. Names vary across releases:
-       * macOS:   macosx64 (current), mac64 (legacy)
-       * Linux:   pc_linux64 / pc_linux
-       * Windows: windows64 / windows
+       * macOS x64 / Apple Silicon: macosx64 (universal, current), mac64 (legacy)
+       * Linux x86_64:              pc_linux64, pc_linux
+       * Linux aarch64:             pc_linux_arm64, pc_linux_arm, pc_linux
+       * Windows x64:               windows64, windows
+       * Windows x86:               windows
     Return all plausible names in priority order; the first existing wins.
     """
     sysname = platform.system()
     arch = platform.machine().lower()
     if sysname == "Darwin":
+        # T32 ships a universal Mach-O so the same dir serves Intel + Apple Silicon.
         return ["macosx64", "mac64"]
     if sysname == "Linux":
-        return ["pc_linux64", "pc_linux"] if arch in ("x86_64", "amd64") else ["pc_linux"]
+        if arch in ("x86_64", "amd64"):
+            return ["pc_linux64", "pc_linux"]
+        if arch in ("aarch64", "arm64"):
+            return ["pc_linux_arm64", "pc_linux_arm", "pc_linux"]
+        if arch.startswith("arm"):
+            return ["pc_linux_arm", "pc_linux"]
+        return ["pc_linux"]
     if sysname == "Windows":
         return ["windows64", "windows"] if arch in ("amd64", "x86_64") else ["windows"]
     raise RuntimeError(f"unsupported host: {sysname} / {arch}")
@@ -168,28 +177,96 @@ def is_port_open(host: str, port: int, timeout: float = 0.3) -> bool:
 def _find_pid_holding_port(port: int) -> int | None:
     """Return the PID of the process listening on TCP `port`, or None.
 
-    Used on macOS where the Qt-built TRACE32 forks: the parent we spawned
-    exits with rc=0 within ~1s and the actual debugger lives in a detached
-    child. Without adopting that child, t32_shutdown can't terminate it.
+    Used on macOS where the Qt-built TRACE32 forks (parent rc=0 exit, real
+    debugger in detached child). Cross-platform behaviour:
+
+      * macOS / BSD: `lsof` (preinstalled).
+      * Linux:       `lsof` first (often present), then parse /proc/net/tcp
+                     + /proc/<pid>/fd/* — works on minimal containers where
+                     lsof isn't shipped.
+      * Windows:     return None. Windows TRACE32 doesn't double-fork so
+                     `proc.pid` is already correct; nothing to adopt.
     """
-    if platform.system() == "Windows":
-        # Windows TRACE32 doesn't double-fork — proc.pid is authoritative.
+    sysname = platform.system()
+    if sysname == "Windows":
         return None
+
+    # 1. lsof (preferred — single call, works on macOS + most Linux)
     try:
         out = subprocess.check_output(
             ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"],
-            stderr=subprocess.DEVNULL,
-            timeout=2.0,
+            stderr=subprocess.DEVNULL, timeout=2.0,
         ).decode().strip()
+        if out:
+            try:
+                return int(out.splitlines()[0])
+            except (ValueError, IndexError):
+                pass
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
             FileNotFoundError, OSError):
+        pass
+
+    # 2. /proc fallback (Linux only — minimal containers without lsof)
+    if sysname == "Linux":
+        try:
+            return _linux_pid_for_listen_port(port)
+        except Exception:
+            pass
+
+    return None
+
+
+def _linux_pid_for_listen_port(port: int) -> int | None:
+    """Read /proc/net/tcp[6] to find a listener inode, then scan
+    /proc/<pid>/fd/* to find which process owns it.
+
+    No external binaries. Costs an O(N) fd scan on first call but is fine
+    for spawn-time adoption.
+    """
+    target_inode = None
+    listen_state = "0A"  # TCP_LISTEN
+    for proc_path in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            with open(proc_path) as fh:
+                next(fh, None)  # header
+                for line in fh:
+                    parts = line.split()
+                    if len(parts) < 10:
+                        continue
+                    local = parts[1]
+                    state = parts[3]
+                    inode = parts[9]
+                    if state != listen_state:
+                        continue
+                    try:
+                        line_port = int(local.rsplit(":", 1)[1], 16)
+                    except (ValueError, IndexError):
+                        continue
+                    if line_port == port:
+                        target_inode = inode
+                        break
+        except FileNotFoundError:
+            continue
+        if target_inode:
+            break
+    if not target_inode:
         return None
-    if not out:
-        return None
-    try:
-        return int(out.splitlines()[0])
-    except (ValueError, IndexError):
-        return None
+    needle = f"socket:[{target_inode}]"
+    proc_root = Path("/proc")
+    for pid_dir in proc_root.iterdir():
+        if not pid_dir.name.isdigit():
+            continue
+        fd_dir = pid_dir / "fd"
+        try:
+            for fd in fd_dir.iterdir():
+                try:
+                    if fd.readlink() == needle:
+                        return int(pid_dir.name)
+                except OSError:
+                    continue
+        except (OSError, PermissionError):
+            continue
+    return None
 
 
 def is_rcl_responsive(host: str, port: int, t32sys: str | None = None,
