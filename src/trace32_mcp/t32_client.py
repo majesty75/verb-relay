@@ -328,9 +328,8 @@ class T32Client:
         """Save the AREA contents to a temp file (on T32 host) then read it.
 
         Only works when the MCP and T32 share a filesystem (true for local sim
-        and for any setup where /tmp is shared). For remote T32, this returns
-        a best-effort empty string and the caller should fall back to the
-        per-command CommandResult.text.
+        on any OS). For remote T32, this returns a best-effort empty string
+        and the caller should fall back to the per-command CommandResult.text.
         """
         import tempfile
         from pathlib import Path
