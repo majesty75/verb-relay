@@ -8,6 +8,7 @@ applied. Falls back to auto-download if no shards are present.
 from __future__ import annotations
 
 import concurrent.futures
+import logging
 import sqlite3
 from pathlib import Path
 from typing import Optional
@@ -16,6 +17,7 @@ from .config import ManualsSettings, default_download_target, load_settings
 from .embed import Embedder
 from .store import open_db, search as vec_search
 
+log = logging.getLogger("trace32-mcp.manuals")
 
 _EMBEDDER: Optional[Embedder] = None
 
@@ -23,6 +25,20 @@ _EMBEDDER: Optional[Embedder] = None
 def _embedder(settings: ManualsSettings) -> Embedder:
     global _EMBEDDER
     if _EMBEDDER is None:
+        # First search of the process loads the model. If it isn't cached yet
+        # this triggers a one-time ~420 MB download from the Hugging Face Hub —
+        # log it so a slow first call is explained, not a silent hang.
+        try:
+            from .prefetch import is_model_cached
+            if not is_model_cached(settings.model_name):
+                log.warning(
+                    "embedding model %r not cached — first search will download "
+                    "it (~400-450 MB) from the Hugging Face Hub. Run "
+                    "`trace32-mcp-prefetch` once to do this with a progress bar.",
+                    settings.model_name,
+                )
+        except Exception:
+            pass
         _EMBEDDER = Embedder(settings.model_name, device=settings.device, batch_size=settings.batch_size)
     return _EMBEDDER
 

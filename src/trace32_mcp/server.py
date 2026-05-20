@@ -30,6 +30,29 @@ from .tools import symbols as syms
 
 log = logging.getLogger("trace32-mcp")
 
+# --- per-tool timeouts -----------------------------------------------------
+# No tool may run forever. Most TRACE32 RCL operations finish in well under a
+# second; we give a generous default and bump the few tools that legitimately
+# wait (spawn boots a process; the first manuals search may download the
+# embedding model). All overridable by env for slow boxes / hardware boot.
+DEFAULT_TOOL_TIMEOUT = float(os.environ.get("TRACE32_MCP_TOOL_TIMEOUT", "60"))
+DOCS_TOOL_TIMEOUT = float(os.environ.get("TRACE32_MCP_DOCS_TIMEOUT", "180"))
+
+
+def _timeout_for(name: str, args: dict) -> float:
+    """Pick a wall-clock timeout (seconds) for a single tool invocation."""
+    if name == "t32_spawn":
+        # spawn has its own RCL-wait timeout_seconds (default 45); allow that
+        # plus headroom for process launch + config write before we give up.
+        try:
+            inner = float(args.get("timeout_seconds") or 45.0)
+        except (TypeError, ValueError):
+            inner = 45.0
+        return inner + 30.0
+    if name in ("t32_search_manuals", "t32_lookup_command"):
+        return DOCS_TOOL_TIMEOUT
+    return DEFAULT_TOOL_TIMEOUT
+
 
 def _schema(model_cls) -> dict[str, Any]:
     return model_cls.model_json_schema()
@@ -170,8 +193,26 @@ def build_server() -> Server:
         if name not in handlers:
             raise ValueError(f"unknown tool: {name}")
         args = arguments or {}
+        timeout = _timeout_for(name, args)
         try:
-            result = await asyncio.to_thread(handlers[name], args)
+            result = await asyncio.wait_for(
+                asyncio.to_thread(handlers[name], args), timeout=timeout
+            )
+        except asyncio.TimeoutError:
+            log.error("tool %s timed out after %.0fs", name, timeout)
+            result = {
+                "ok": False,
+                "error": f"tool {name} timed out after {timeout:.0f}s",
+                "error_type": "TimeoutError",
+                "timeout_seconds": timeout,
+                "hint": (
+                    "The work may still be finishing in the background. "
+                    "If this is t32_search_manuals on first use, the embedding "
+                    "model is downloading — run `trace32-mcp-prefetch` once, or "
+                    "raise TRACE32_MCP_DOCS_TIMEOUT. For other tools raise "
+                    "TRACE32_MCP_TOOL_TIMEOUT or check the target is responsive."
+                ),
+            }
         except Exception as e:
             log.exception("tool %s failed", name)
             result = {"ok": False, "error": str(e), "error_type": type(e).__name__}
