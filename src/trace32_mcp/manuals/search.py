@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import logging
+import os
 import sqlite3
 from pathlib import Path
 from typing import Optional
@@ -25,21 +26,35 @@ _EMBEDDER: Optional[Embedder] = None
 def _embedder(settings: ManualsSettings) -> Embedder:
     global _EMBEDDER
     if _EMBEDDER is None:
-        # First search of the process loads the model. If it isn't cached yet
-        # this triggers a one-time ~420 MB download from the Hugging Face Hub —
-        # log it so a slow first call is explained, not a silent hang.
+        # First search of the process loads the model. Decide up front whether
+        # it's already cached: if so we load strictly offline so a corporate
+        # network can't hang the load on a HF revision-check. If not, we must
+        # stay online to download it once.
+        cached = False
         try:
             from .prefetch import is_model_cached
-            if not is_model_cached(settings.model_name):
-                log.warning(
-                    "embedding model %r not cached — first search will download "
-                    "it (~400-450 MB) from the Hugging Face Hub. Run "
-                    "`trace32-mcp-prefetch` once to do this with a progress bar.",
-                    settings.model_name,
-                )
+            cached = is_model_cached(settings.model_name)
         except Exception:
-            pass
-        _EMBEDDER = Embedder(settings.model_name, device=settings.device, batch_size=settings.batch_size)
+            cached = False
+
+        if cached:
+            # Belt-and-suspenders: also flip the env so any nested HF call in
+            # transformers/tokenizers stays offline too. Only when we KNOW the
+            # weights are present, and only if the user hasn't set it already.
+            os.environ.setdefault("HF_HUB_OFFLINE", "1")
+            os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+        else:
+            log.warning(
+                "embedding model %r not cached — first search will download "
+                "it (~400-450 MB) from the Hugging Face Hub. Run "
+                "`trace32-mcp-prefetch` once to do this with a progress bar.",
+                settings.model_name,
+            )
+
+        _EMBEDDER = Embedder(
+            settings.model_name, device=settings.device,
+            batch_size=settings.batch_size, local_files_only=cached,
+        )
     return _EMBEDDER
 
 

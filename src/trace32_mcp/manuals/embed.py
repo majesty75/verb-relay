@@ -16,12 +16,20 @@ class Embedder:
 
     QUERY_PREFIX = "Represent this query for retrieving relevant TRACE32 documentation: "
 
-    def __init__(self, model_name: str, device: str = "auto", batch_size: int = 32) -> None:
+    def __init__(self, model_name: str, device: str = "auto", batch_size: int = 32,
+                 local_files_only: bool = False) -> None:
         from sentence_transformers import SentenceTransformer
 
         resolved = resolve_device(device)
         self.device = resolved
-        self.model = SentenceTransformer(model_name, device=resolved)
+        # When the model is already cached we force local_files_only so
+        # SentenceTransformer/huggingface_hub never makes a revision-check
+        # network call. On a locked-down corporate network that probe can hang
+        # for minutes (HF retry/backoff) even though the weights are local —
+        # that, not the download, is the usual "search never returns" cause.
+        self.model = SentenceTransformer(
+            model_name, device=resolved, local_files_only=local_files_only
+        )
         self.batch_size = batch_size
         self.dim = int(self.model.get_sentence_embedding_dimension())
 
