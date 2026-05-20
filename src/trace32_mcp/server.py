@@ -194,10 +194,12 @@ def build_server() -> Server:
             raise ValueError(f"unknown tool: {name}")
         args = arguments or {}
         timeout = _timeout_for(name, args)
+        log.info("tool %s called (timeout=%.0fs)", name, timeout)
         try:
             result = await asyncio.wait_for(
                 asyncio.to_thread(handlers[name], args), timeout=timeout
             )
+            log.info("tool %s returned ok", name)
         except asyncio.TimeoutError:
             log.error("tool %s timed out after %.0fs", name, timeout)
             result = {
@@ -221,12 +223,38 @@ def build_server() -> Server:
     return server
 
 
+def _startup_banner() -> None:
+    """Log version + backend + paths so `claude --debug` proves which build is
+    actually running (stale uvx caches were biting us)."""
+    import importlib.metadata as md
+    import importlib.util as iu
+
+    import trace32_mcp
+    try:
+        ver = md.version("trace32-mcp")
+    except Exception:
+        ver = "unknown"
+    onnx = False
+    try:
+        from .manuals.onnx_embed import onnx_model_available
+        onnx = onnx_model_available()
+    except Exception:
+        pass
+    torch_present = iu.find_spec("torch") is not None
+    log.info(
+        "trace32-mcp v%s starting | pkg=%s | onnx_model_bundled=%s | torch_importable=%s | python=%s",
+        ver, os.path.dirname(trace32_mcp.__file__), onnx, torch_present,
+        __import__("sys").version.split()[0],
+    )
+
+
 async def _amain() -> None:
     logging.basicConfig(
         level=os.environ.get("TRACE32_MCP_LOG", "INFO"),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         stream=__import__("sys").stderr,
     )
+    _startup_banner()
     server = build_server()
     async with stdio_server() as (read_stream, write_stream):
         await server.run(read_stream, write_stream, server.create_initialization_options())
