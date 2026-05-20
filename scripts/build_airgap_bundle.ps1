@@ -1,16 +1,22 @@
 # Build a self-contained offline bundle for an air-gapped Windows machine.
 #
-# Run this on an INTERNET-CONNECTED Windows box with the SAME Python
-# version/arch as the target air-gapped machine. It produces a single folder
-# (and .zip) containing:
-#   * the trace32-mcp wheel (with the ONNX model + manuals DB baked in)
-#   * a wheelhouse of every runtime dependency as .whl files
-#   * an install script for the offline machine
-#
-# Transfer the .zip to the air-gapped machine and run install_offline.ps1.
+# DEFAULT (recommended): download the published, prebuilt wheel (ONNX model +
+# manuals DB already baked in) and all its RUNTIME deps into a wheelhouse. This
+# needs NO torch and NO clone — just pip download. Run it on an internet box
+# with the SAME OS/arch/Python version as the air-gapped target.
 #
 #   powershell -ExecutionPolicy Bypass -File scripts\build_airgap_bundle.ps1
 #
+# OPTIONAL: -FromSource builds the wheel from this checkout instead, which
+# exports the ONNX model and therefore DOES download torch (one-time, build
+# machine only — torch never enters the bundle).
+#
+#   powershell -ExecutionPolicy Bypass -File scripts\build_airgap_bundle.ps1 -FromSource
+#
+param(
+    [switch]$FromSource,
+    [string]$WheelUrl = "https://github.com/majesty75/verb-relay/releases/download/v0.1.0/trace32_mcp-0.1.0-py3-none-any.whl"
+)
 $ErrorActionPreference = "Stop"
 $repo = Split-Path -Parent $PSScriptRoot
 Set-Location $repo
@@ -19,35 +25,37 @@ $wheelhouse = Join-Path $out "wheelhouse"
 Remove-Item -Recurse -Force $out -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $wheelhouse | Out-Null
 
-# 1. Make sure the ONNX model is vendored (needs the [build] extra: torch etc.)
-if (-not (Test-Path "src\trace32_mcp\model\model.onnx")) {
-    Write-Host "[bundle] ONNX model missing — exporting it (one-time, needs internet + torch)..."
-    python -m pip install -e ".[build]"
-    python scripts\build_onnx_model.py
+if ($FromSource) {
+    # Build from this checkout (exports the model -> needs torch on THIS box).
+    if (-not (Test-Path "src\trace32_mcp\model\model.onnx")) {
+        Write-Host "[bundle] exporting ONNX model (one-time, needs internet + torch)..."
+        python -m pip install -e ".[build]"
+        python scripts\build_onnx_model.py
+    }
+    Write-Host "[bundle] building the wheel..."
+    python -m pip install -q --upgrade build
+    python -m build --wheel --outdir $out
+    $wheel = (Get-ChildItem $out -Filter "trace32_mcp-*.whl" | Select-Object -First 1).FullName
+    Write-Host "[bundle] downloading runtime deps (no torch)..."
+    python -m pip download $wheel --dest $wheelhouse
+} else {
+    # Torch-free path: pull the published wheel + its runtime deps. No torch.
+    Write-Host "[bundle] downloading published wheel + runtime deps (no torch, no clone)..."
+    Write-Host "         $WheelUrl"
+    python -m pip download $WheelUrl --dest $wheelhouse
 }
-
-# 2. Build the wheel (model + DB baked in via package-data)
-Write-Host "[bundle] building the trace32-mcp wheel..."
-python -m pip install -q --upgrade build
-python -m build --wheel --outdir $out
-$wheel = Get-ChildItem $out -Filter "trace32_mcp-*.whl" | Select-Object -First 1
-
-# 3. Download all RUNTIME deps for this platform into the wheelhouse
-Write-Host "[bundle] downloading runtime dependencies into the wheelhouse..."
-python -m pip download $wheel.FullName --dest $wheelhouse
-# pip itself, so the offline box can install even without it
+# pip itself so the offline box can install even without it
 python -m pip download pip setuptools wheel --dest $wheelhouse
 
-# 4. Write the offline installer + zip everything
 @'
 # Run on the AIR-GAPPED machine. Installs trace32-mcp with zero network.
 $ErrorActionPreference = "Stop"
 $here = $PSScriptRoot
 python -m pip install --no-index --find-links "$here\wheelhouse" trace32-mcp
 Write-Host ""
-Write-Host "Installed. Register the MCP server with:"
+Write-Host "Installed (torch-free). Register the MCP server with:"
 Write-Host '  claude mcp add trace32 -s user -- trace32-mcp'
-Write-Host "Verify the search path with:  trace32-mcp-selftest --dump-after 0"
+Write-Host "Verify:  trace32-mcp-selftest --dump-after 0"
 '@ | Set-Content (Join-Path $out "install_offline.ps1")
 
 $zip = Join-Path $repo "trace32-mcp-airgap-bundle.zip"
@@ -55,4 +63,4 @@ Remove-Item -Force $zip -ErrorAction SilentlyContinue
 Compress-Archive -Path "$out\*" -DestinationPath $zip
 Write-Host ""
 Write-Host "[bundle] DONE -> $zip"
-Write-Host "[bundle] Copy it to the air-gapped machine, unzip, and run install_offline.ps1"
+Write-Host "[bundle] Copy to the air-gapped machine, unzip, run install_offline.ps1"

@@ -14,25 +14,35 @@ There are two machines involved:
 
 ## 1. On the build machine (one time)
 
-Clone the repo, then build the bundle. The script exports the ONNX model (needs
-`torch` once, via the `[build]` extra), builds the self-contained wheel, and
-downloads every runtime dependency as a wheel into a `wheelhouse/`.
+The default path needs **no torch and no clone** — it downloads the published
+prebuilt wheel (ONNX model + manuals DB already baked in) plus all its runtime
+deps into a `wheelhouse/`. Simplest of all is a one-liner:
+
+```powershell
+mkdir wheelhouse
+python -m pip download "https://github.com/majesty75/verb-relay/releases/download/v0.1.0/trace32_mcp-0.1.0-py3-none-any.whl" --dest wheelhouse
+# zip the wheelhouse folder and transfer it
+```
+
+Or use the bundle script (also writes an `install_offline` helper and zips it):
 
 **Windows (PowerShell):**
 ```powershell
-git clone https://github.com/majesty75/verb-relay.git
-cd verb-relay
+# grab just the script, or clone — either works
 powershell -ExecutionPolicy Bypass -File scripts\build_airgap_bundle.ps1
-# -> trace32-mcp-airgap-bundle.zip
+# -> trace32-mcp-airgap-bundle.zip   (torch-free)
 ```
 
 **Linux / macOS:**
 ```bash
-git clone https://github.com/majesty75/verb-relay.git
-cd verb-relay
 bash scripts/build_airgap_bundle.sh
-# -> trace32-mcp-airgap-bundle.tar.gz
+# -> trace32-mcp-airgap-bundle.tar.gz   (torch-free)
 ```
+
+> Building **from source** instead (to regenerate the model) is opt-in:
+> `build_airgap_bundle.ps1 -FromSource` / `build_airgap_bundle.sh --from-source`.
+> That exports the ONNX model and therefore downloads torch — but **only on the
+> build machine**; torch never enters the wheelhouse or the air-gapped PC.
 
 The bundle contains:
 ```
