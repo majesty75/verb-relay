@@ -20,8 +20,11 @@ dependencies = [
     "pydantic>=2.7.0",
     "numpy>=1.26.0",
     "sqlite-vec>=0.1.6",
-    "sentence-transformers>=3.0.0",
-    "torch>=2.2.0",
+    # Embedding runtime: ONNX model + tokenizer, NO torch. onnxruntime CPU is a
+    # ~10 MB wheel and tokenizers is a small Rust wheel — both trivial to vendor
+    # for air-gapped installs. The vendored model lives in trace32_mcp/model/.
+    "onnxruntime>=1.17.0",
+    "tokenizers>=0.15.0",
     "zstandard>=0.22.0",
     # Lauterbach's official native Python RCL implementation (PYRCL).
     # Replaces the legacy ctypes + libt32api shared-library plumbing.
@@ -29,9 +32,21 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Adds the ingest pipeline (PDF parsing + chunker + optional OCR) and the
-# `t32-rag` CLI. End users running the MCP server do NOT need these.
+# The sentence-transformers / torch path. Only needed as a FALLBACK when no
+# vendored ONNX model is present, or to (re)build the ONNX model / DB. End
+# users on the shipped wheel do NOT need this — that's the whole point.
+torch = [
+    "sentence-transformers>=3.0.0",
+    "torch>=2.2.0",
+]
+# Adds the ingest pipeline (PDF parsing + chunker + optional OCR), the ONNX
+# export deps, and the `t32-rag` CLI. End users running the MCP server do NOT
+# need these.
 build = [
+    "sentence-transformers>=3.0.0",
+    "torch>=2.2.0",
+    "onnx>=1.16.0",
+    "onnxscript>=0.1.0",
     "pymupdf>=1.24.0",
     "tqdm>=4.66.0",
     "click>=8.1.0",
@@ -54,4 +69,4 @@ Issues   = "https://github.com/REPLACE_ME/Trace32-MCP/issues"
 where = ["src"]
 
 [tool.setuptools.package-data]
-trace32_mcp = ["py.typed", "db/*.db"]
+trace32_mcp = ["py.typed", "db/*.db", "model/model.onnx", "model/tokenizer.json", "model/meta.json"]

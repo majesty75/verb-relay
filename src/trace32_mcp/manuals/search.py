@@ -15,46 +15,69 @@ from pathlib import Path
 from typing import Optional
 
 from .config import ManualsSettings, default_download_target, load_settings
-from .embed import Embedder
 from .store import open_db, search as vec_search
 
 log = logging.getLogger("trace32-mcp.manuals")
 
-_EMBEDDER: Optional[Embedder] = None
+_EMBEDDER = None  # type: ignore[var-annotated]
 
 
-def _embedder(settings: ManualsSettings) -> Embedder:
+def _make_embedder(settings: ManualsSettings):
+    """Pick the embedding backend.
+
+    Default: the vendored ONNX model (onnxruntime + tokenizers, no torch, no
+    network) — this is what ships in the wheel and works air-gapped. If no
+    ONNX model is present (e.g. a dev source checkout that hasn't run
+    scripts/build_onnx_model.py), fall back to the sentence-transformers /
+    torch path, loading strictly offline when the model is already cached so a
+    locked-down network can't hang the load on a HF revision-check.
+
+    Override with T32_MANUALS_BACKEND=onnx|torch.
+    """
+    backend = os.environ.get("T32_MANUALS_BACKEND", "auto").lower()
+
+    if backend in ("auto", "onnx"):
+        try:
+            from .onnx_embed import OnnxEmbedder, onnx_model_available
+            if backend == "onnx" or onnx_model_available():
+                emb = OnnxEmbedder(batch_size=settings.batch_size)
+                log.info("manuals: using vendored ONNX embedder (dim=%d, no torch)", emb.dim)
+                return emb
+        except Exception as e:
+            if backend == "onnx":
+                raise
+            log.warning("ONNX embedder unavailable (%s) — falling back to sentence-transformers", e)
+
+    # sentence-transformers / torch fallback
+    from .embed import Embedder
+    cached = False
+    try:
+        from .prefetch import is_model_cached
+        cached = is_model_cached(settings.model_name)
+    except Exception:
+        cached = False
+    if cached:
+        os.environ.setdefault("HF_HUB_OFFLINE", "1")
+        os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+    else:
+        log.warning(
+            "embedding model %r not cached and no vendored ONNX model — first "
+            "search will download it (~400-450 MB) from the Hugging Face Hub. "
+            "Run `trace32-mcp-prefetch`, or ship the ONNX model "
+            "(scripts/build_onnx_model.py).",
+            settings.model_name,
+        )
+    log.info("manuals: using sentence-transformers/torch embedder")
+    return Embedder(
+        settings.model_name, device=settings.device,
+        batch_size=settings.batch_size, local_files_only=cached,
+    )
+
+
+def _embedder(settings: ManualsSettings):
     global _EMBEDDER
     if _EMBEDDER is None:
-        # First search of the process loads the model. Decide up front whether
-        # it's already cached: if so we load strictly offline so a corporate
-        # network can't hang the load on a HF revision-check. If not, we must
-        # stay online to download it once.
-        cached = False
-        try:
-            from .prefetch import is_model_cached
-            cached = is_model_cached(settings.model_name)
-        except Exception:
-            cached = False
-
-        if cached:
-            # Belt-and-suspenders: also flip the env so any nested HF call in
-            # transformers/tokenizers stays offline too. Only when we KNOW the
-            # weights are present, and only if the user hasn't set it already.
-            os.environ.setdefault("HF_HUB_OFFLINE", "1")
-            os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
-        else:
-            log.warning(
-                "embedding model %r not cached — first search will download "
-                "it (~400-450 MB) from the Hugging Face Hub. Run "
-                "`trace32-mcp-prefetch` once to do this with a progress bar.",
-                settings.model_name,
-            )
-
-        _EMBEDDER = Embedder(
-            settings.model_name, device=settings.device,
-            batch_size=settings.batch_size, local_files_only=cached,
-        )
+        _EMBEDDER = _make_embedder(settings)
     return _EMBEDDER
 
 

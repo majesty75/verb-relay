@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import faulthandler
+import os
 import sys
 import time
 
@@ -37,43 +38,41 @@ def selftest(query: str = "hardware breakpoint cortex-m7", k: int = 3,
 
     t_total = time.time()
     try:
-        _stage("1/7 loading settings + discovering DB shards ...")
+        _stage("1/6 loading settings + discovering DB shards ...")
         from .config import load_settings
         s = load_settings()
         _stage(f"      DBs found: {[str(p) for p in s.db_paths] or 'NONE'}")
-        _stage(f"      model={s.model_name!r} device={s.device}")
 
-        _stage("2/7 importing torch (first import can be slow) ...")
-        t = time.time(); import torch  # noqa: F401
-        _stage(f"      torch {torch.__version__} in {time.time()-t:.1f}s")
+        _stage("2/6 selecting embedding backend ...")
+        from .onnx_embed import onnx_model_available, model_dir
+        backend_env = os.environ.get("T32_MANUALS_BACKEND", "auto").lower()
+        has_onnx = onnx_model_available()
+        use_onnx = has_onnx and backend_env in ("auto", "onnx")
+        if use_onnx:
+            _stage(f"      ONNX (no torch) — vendored model at {model_dir()}")
+            import onnxruntime, tokenizers  # noqa: F401
+            _stage(f"      onnxruntime={onnxruntime.__version__} tokenizers={tokenizers.__version__}")
+        else:
+            _stage(f"      sentence-transformers/torch (onnx_available={has_onnx}, backend={backend_env})")
+            _stage("3/6 importing torch (first import can be slow) ...")
+            t = time.time(); import torch  # noqa: F401
+            _stage(f"      torch {torch.__version__} in {time.time()-t:.1f}s")
+            import sentence_transformers as st  # noqa: F401
+            _stage(f"      sentence-transformers {st.__version__}")
+            from .prefetch import is_model_cached
+            _stage(f"      model cached={is_model_cached(s.model_name)} (cached -> offline load)")
 
-        _stage("3/7 importing sentence_transformers ...")
-        t = time.time(); import sentence_transformers as st  # noqa: F401
-        _stage(f"      sentence-transformers {st.__version__} in {time.time()-t:.1f}s")
-        try:
-            import transformers, tokenizers  # noqa: F401
-            _stage(f"      transformers={transformers.__version__} "
-                   f"tokenizers={tokenizers.__version__}")
-        except Exception as _e:
-            _stage(f"      (couldn't read transformers/tokenizers versions: {_e})")
-
-        _stage("4/7 checking model cache (local only, no network) ...")
-        from .prefetch import is_model_cached
-        cached = is_model_cached(s.model_name)
-        _stage(f"      cached={cached}  (cached -> loads offline)")
-
-        _stage("5/7 loading the embedding model "
-               "(THIS is where a corporate-network hang usually happens) ...")
+        _stage("4/6 loading the embedding model ...")
         t = time.time()
         from .search import _embedder
         emb = _embedder(s)
         _stage(f"      model loaded in {time.time()-t:.1f}s, dim={emb.dim}")
 
-        _stage("6/7 encoding the query ...")
+        _stage("5/6 encoding the query ...")
         t = time.time(); _ = emb.encode_query(query)
         _stage(f"      encoded in {time.time()-t:.1f}s")
 
-        _stage("7/7 running the full vector search ...")
+        _stage("6/6 running the full vector search ...")
         t = time.time()
         from .search import search_manuals
         hits = search_manuals(query, k=k)

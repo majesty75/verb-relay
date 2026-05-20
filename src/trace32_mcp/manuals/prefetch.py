@@ -55,6 +55,18 @@ def ensure_model(model_name: str | None = None, *, force: bool = False,
     """
     name = model_name or load_settings().model_name or DEFAULT_MODEL
 
+    # If a vendored ONNX model is bundled, the runtime never touches the Hugging
+    # Face Hub or torch — there is nothing to prefetch.
+    try:
+        from .onnx_embed import onnx_model_available, model_dir
+        if onnx_model_available() and os.environ.get("T32_MANUALS_BACKEND", "auto").lower() != "torch":
+            print(f"[trace32-mcp] vendored ONNX model present ({model_dir()}); "
+                  "no download needed (runtime uses onnxruntime, not torch).",
+                  file=sys.stderr, flush=True)
+            return {"ok": True, "model": name, "status": "onnx_bundled", "elapsed_s": 0.0}
+    except Exception:
+        pass
+
     # Make sure HF progress bars are visible — never suppress them here, this
     # is the one place the user explicitly wants to watch the download.
     os.environ.pop("HF_HUB_DISABLE_PROGRESS_BARS", None)

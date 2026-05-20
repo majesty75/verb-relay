@@ -30,3 +30,7 @@ shards_v2/
 # Egg-info regenerated on every install
 *.egg-info/
 
+
+# Vendored ONNX model — too big for git; built by scripts/build_onnx_model.py and bundled into the wheel.
+src/trace32_mcp/model/model.onnx
+build_model/
