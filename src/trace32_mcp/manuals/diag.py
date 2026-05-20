@@ -26,9 +26,12 @@ def _stage(msg: str) -> None:
 
 def selftest(query: str = "hardware breakpoint cortex-m7", k: int = 3,
              dump_after: float = 30.0) -> int:
-    faulthandler.enable()
-    # If any stage blocks longer than dump_after, print every thread's stack
-    # to stderr (repeating) — this is what reveals a hung network call.
+    # NOTE: deliberately NOT calling faulthandler.enable(). On Windows that
+    # installs an SEH handler that reports torch's internally-HANDLED
+    # first-chance exceptions during import as "Windows fatal exception:
+    # access violation" — a well-known false alarm, not a real crash.
+    # dump_traceback_later uses its own timer thread and works without it, so
+    # we still get a hang stack without the import noise.
     if dump_after > 0:
         faulthandler.dump_traceback_later(dump_after, repeat=True, file=sys.stderr)
 
@@ -47,6 +50,12 @@ def selftest(query: str = "hardware breakpoint cortex-m7", k: int = 3,
         _stage("3/7 importing sentence_transformers ...")
         t = time.time(); import sentence_transformers as st  # noqa: F401
         _stage(f"      sentence-transformers {st.__version__} in {time.time()-t:.1f}s")
+        try:
+            import transformers, tokenizers  # noqa: F401
+            _stage(f"      transformers={transformers.__version__} "
+                   f"tokenizers={tokenizers.__version__}")
+        except Exception as _e:
+            _stage(f"      (couldn't read transformers/tokenizers versions: {_e})")
 
         _stage("4/7 checking model cache (local only, no network) ...")
         from .prefetch import is_model_cached

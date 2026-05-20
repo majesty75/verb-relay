@@ -31,7 +31,12 @@ class Embedder:
             model_name, device=resolved, local_files_only=local_files_only
         )
         self.batch_size = batch_size
-        self.dim = int(self.model.get_sentence_embedding_dimension())
+        # `get_sentence_embedding_dimension` is deprecated in sentence-transformers
+        # 5.x (renamed to `get_embedding_dimension`); use the new name when
+        # present so we don't depend on the deprecated alias.
+        get_dim = getattr(self.model, "get_embedding_dimension", None) or \
+            self.model.get_sentence_embedding_dimension
+        self.dim = int(get_dim())
 
     def encode_passages(self, texts: Sequence[str]) -> np.ndarray:
         return np.asarray(
