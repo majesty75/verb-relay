@@ -282,9 +282,14 @@ class T32Client:
             except Exception:
                 pass
             try:
-                # PRACTICE.STATE() returns 0=idle, 1=run, 2=error per
-                # general_func.pdf. PYRCL has no direct accessor — go via fnc.
-                pstate = int(self._dbg.fnc("PRACTICE.STATE()"))
+                # PRACTICE script run-state via the native RCL call
+                # (T32_GetPracticeState): 0 = idle, 1 = a PRACTICE script is
+                # still running. There is NO `PRACTICE.STATE()` PRACTICE
+                # function — calling one would raise "no function ... exists,
+                # don't use commands as functions" and pop an error on every
+                # command. Per-command error detection is handled by the
+                # message ERROR_MASK below, not by this state.
+                pstate = int(self._dbg._get_practice_state())
             except Exception:
                 pstate = 0  # unknown — don't false-fail because we couldn't ask
             # Capture AREA output of this specific command.
