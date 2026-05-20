@@ -43,6 +43,7 @@ dev = ["pytest>=8.0", "ruff>=0.6.0"]
 [project.scripts]
 trace32-mcp          = "trace32_mcp.server:main"
 trace32-mcp-prefetch = "trace32_mcp.manuals.prefetch:main"
+trace32-mcp-selftest = "trace32_mcp.manuals.diag:main"
 t32-rag              = "trace32_mcp.manuals_build.cli:main"
 
 [project.urls]
