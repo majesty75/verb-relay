@@ -63,6 +63,15 @@ def ensure_model(model_name: str | None = None, *, force: bool = False,
     if already and not force:
         return {"ok": True, "model": name, "status": "already_cached", "elapsed_s": 0.0}
 
+    # We are about to (re)download. If the user has pinned offline mode (e.g.
+    # in the MCP server env, or via `setx HF_HUB_OFFLINE 1`), clear it for this
+    # process so the fetch can actually reach the Hub — otherwise --force is a
+    # no-op against a corrupt cache.
+    for var in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"):
+        if os.environ.pop(var, None):
+            print(f"[trace32-mcp] {var} was set — clearing it so the download can proceed.",
+                  file=sys.stderr, flush=True)
+
     resolved = resolve_device(device)
     print(
         f"[trace32-mcp] downloading embedding model {name!r} "
