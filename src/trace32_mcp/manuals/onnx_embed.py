@@ -18,6 +18,10 @@ from __future__ import annotations
 
 import json
 import os
+
+# Disable Hugging Face tokenizer parallelism to prevent subprocess deadlocks
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 from pathlib import Path
 from typing import Sequence
 
@@ -56,7 +60,7 @@ class OnnxEmbedder:
     """
 
     def __init__(self, mdir: Path | None = None, batch_size: int = 32,
-                 num_threads: int | None = None) -> None:
+                 num_threads: int | None = 1) -> None:
         import onnxruntime as ort
         from tokenizers import Tokenizer
 
@@ -85,8 +89,10 @@ class OnnxEmbedder:
         self._tok.enable_truncation(max_length=self.max_seq_length)
 
         so = ort.SessionOptions()
+        so.log_severity_level = 3  # Error/Fatal only
         if num_threads:
             so.intra_op_num_threads = int(num_threads)
+            so.inter_op_num_threads = int(num_threads)
         self._sess = ort.InferenceSession(
             str(d / "model.onnx"), sess_options=so,
             providers=["CPUExecutionProvider"],

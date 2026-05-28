@@ -124,7 +124,7 @@ def search_manuals(
         for db in dbs:
             all_hits.extend(_query_one(db))
     else:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(dbs), 8)) as ex:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(dbs), 4)) as ex:
             for shard_hits in ex.map(_query_one, dbs):
                 all_hits.extend(shard_hits)
 

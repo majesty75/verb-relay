@@ -42,12 +42,18 @@ def _vec_schema(dim: int) -> str:
     return f"CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vec USING vec0(embedding float[{dim}]);"
 
 
+import threading
+
+_SQLITE_VEC_LOCK = threading.Lock()
+
+
 @contextmanager
 def open_db(path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path)
     conn.enable_load_extension(True)
-    sqlite_vec.load(conn)
+    with _SQLITE_VEC_LOCK:
+        sqlite_vec.load(conn)
     conn.enable_load_extension(False)
     try:
         yield conn

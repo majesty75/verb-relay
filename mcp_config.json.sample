@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "trace32": {
+      "command": "C:\\Path\\To\\Python\\Scripts\\trace32-mcp.exe",
+      "args": [],
+      "env": {
+        "// T32SYS": "Optional: Path to your TRACE32 installation, e.g. C:\\T32",
+        "T32SYS": "C:\\T32",
+        
+        "// T32_MANUALS_PARALLEL": "Set to 1 to run manual database searches in parallel across up to 4 threads",
+        "T32_MANUALS_PARALLEL": "1"
+      }
+    }
+  }
+}

@@ -249,13 +249,34 @@ def _startup_banner() -> None:
 
 
 async def _amain() -> None:
+    import sys
+    from pathlib import Path
+
+    log_file = os.environ.get("TRACE32_MCP_LOG_FILE")
+    if log_file:
+        stream = open(log_file, "a", encoding="utf-8")
+    else:
+        # Default to a file in cache dir to prevent Windows stderr pipe block deadlocks
+        cache_dir = Path.home() / ".cache" / "trace32-mcp"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        stream = open(cache_dir / "server.log", "a", encoding="utf-8")
+
     logging.basicConfig(
         level=os.environ.get("TRACE32_MCP_LOG", "INFO"),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        stream=__import__("sys").stderr,
+        stream=stream,
     )
     _startup_banner()
     server = build_server()
+
+    # Pre-warm the embedding model in a background thread to prevent first-call timeouts
+    try:
+        from .manuals.config import load_settings
+        from .manuals.search import _embedder
+        asyncio.create_task(asyncio.to_thread(_embedder, load_settings()))
+    except Exception as e:
+        log.warning("failed to start pre-warming manuals embedder: %s", e)
+
     async with stdio_server() as (read_stream, write_stream):
         await server.run(read_stream, write_stream, server.create_initialization_options())
 
