@@ -147,6 +147,12 @@ TOOLS: list[tuple[str, str, Callable[[dict], dict], Any]] = [
     ("t32_var_view",
         "Typed variable view (handles structs/arrays).",
         syms.t32_var_view, syms.VarViewInput),
+    ("t32_search_variables",
+        "Search global variables matching a wildcard/glob pattern (e.g. 'my_var*' or '*state*').",
+        syms.t32_search_variables, syms.SearchVariablesInput),
+    ("t32_inspect_structure",
+        "Inspect a complex structure recursively and dump all its members, types, and values.",
+        syms.t32_inspect_structure, syms.InspectStructureInput),
 
     # ---- scripting (universal escape hatch) ------------------------------
     ("t32_run_practice",

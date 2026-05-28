@@ -512,6 +512,175 @@ class T32Client:
                 break
         return out
 
+    def search_variables(self, pattern: str, limit: int = 200) -> list[dict]:
+        """Search global variables matching a pattern using sYmbol.ForEach."""
+        with self._lock:
+            self._ensure_connected()
+            try:
+                self._dbg.cmd("AREA.CLEAR MCPLOG")
+                # We use sYmbol.ForEach to print matching variables to MCPLOG
+                # Double quotes inside quotes must be doubled for PRACTICE: ""
+                cmd = (
+                    f'sYmbol.ForEach '
+                    f'"if sYmbol.TYPE(*)==3 ( PRINT ""VAR:*:"", Var.TYPEOF(*), "":"", Var.ADDRESS(*), "":"", Var.SIZEOF(*) )" '
+                    f'{pattern}'
+                )
+                self._dbg.cmd(cmd)
+            except Exception as e:
+                return [{"_error": f"sYmbol.ForEach failed: {e}"}]
+            txt = self._read_area_inline("MCPLOG")
+
+        # Parse MCPLOG lines starting with "VAR:"
+        out = []
+        for line in txt.splitlines():
+            line = line.strip()
+            if not line or not line.startswith("VAR:"):
+                continue
+            parts = line.split(":", 5)
+            if len(parts) >= 6:
+                name = parts[1]
+                vtype = parts[2]
+                addr = parts[3]
+                size_str = parts[4]
+                try:
+                    size = int(size_str.strip('.'))
+                except Exception:
+                    size = size_str
+                out.append({
+                    "name": name,
+                    "type": vtype,
+                    "address": addr,
+                    "size": size,
+                })
+            if len(out) >= limit:
+                break
+        return out
+
+    def inspect_structure(self, name: str) -> dict:
+        """Inspect a structure's members recursively by printing to a temporary file via WinPrint."""
+        import tempfile
+        import time as _time
+        from pathlib import Path as _P
+
+        # Create a temp file path that both Python and TRACE32 can access
+        tmp = _P(tempfile.gettempdir()) / f"trace32_mcp_struct_{self.endpoint.port}_{int(_time.time())}.txt"
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+
+        with self._lock:
+            self._ensure_connected()
+            try:
+                # Set printer file to temp file in ASCII format
+                self._dbg.cmd(f'PRinTer.FILE "{tmp.as_posix()}" ASCII')
+                # Redirect Var.View %type %m %r to printer (which writes to the file and closes it)
+                self._dbg.cmd(f'WinPrint.Var.View %type %m %r {name}')
+            except Exception as e:
+                return {"ok": False, "error": f"WinPrint command failed: {e}"}
+
+        # Wait for file to be written
+        content = ""
+        for _ in range(30):
+            if tmp.exists():
+                # Wait a tiny bit for write to complete
+                _time.sleep(0.05)
+                try:
+                    content = tmp.read_text(errors="replace")
+                    break
+                except Exception:
+                    pass
+            _time.sleep(0.05)
+
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+        if not content:
+            return {"ok": False, "error": f"Structure {name} could not be inspected or file was empty."}
+
+        # Parse content
+        parsed = self._parse_var_view(content)
+        if not parsed:
+            return {"ok": False, "error": "Failed to parse structure content.", "raw": content}
+
+        return {"ok": True, "structure": parsed}
+
+    def _parse_var_view(self, text: str) -> dict:
+        def extract_type_and_name(text: str) -> tuple[str, str]:
+            text = text.strip()
+            if text.startswith("("):
+                depth = 0
+                for idx, char in enumerate(text):
+                    if char == "(":
+                        depth += 1
+                    elif char == ")":
+                        depth -= 1
+                        if depth == 0:
+                            type_str = text[1:idx].strip()
+                            name_str = text[idx+1:].strip()
+                            return type_str, name_str
+            elif text.endswith(")"):
+                depth = 0
+                for idx in range(len(text) - 1, -1, -1):
+                    char = text[idx]
+                    if char == ")":
+                        depth += 1
+                    elif char == "(":
+                        depth -= 1
+                        if depth == 0:
+                            name_str = text[:idx].strip()
+                            type_str = text[idx+1:-1].strip()
+                            return type_str, name_str
+            return "", text
+
+        lines = text.splitlines()
+        root = {"name": "root", "type": "", "value": "", "members": []}
+        stack = [root]
+
+        for line in lines:
+            stripped = line.strip()
+            if not stripped or stripped.startswith(";"):
+                continue
+
+            if stripped == ")":
+                if len(stack) > 1:
+                    stack.pop()
+                continue
+
+            if "=" in stripped:
+                name_part, value_part = stripped.split("=", 1)
+                name_part = name_part.strip()
+                value_part = value_part.strip()
+            else:
+                name_part = stripped
+                value_part = ""
+
+            is_container = False
+            if value_part == "(" or value_part.endswith("("):
+                is_container = True
+                value_part = ""
+
+            type_str, name_str = extract_type_and_name(name_part)
+
+            member = {
+                "name": name_str,
+                "type": type_str,
+                "value": value_part,
+            }
+            if is_container:
+                member["members"] = []
+
+            stack[-1]["members"].append(member)
+
+            if is_container:
+                stack.append(member)
+
+        if root["members"]:
+            return root["members"][0]
+        return {}
+
     # ---- breakpoints --------------------------------------------------------
 
     def bp_list(self) -> list[dict]:

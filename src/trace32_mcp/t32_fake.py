@@ -206,6 +206,51 @@ class FakeT32Client:
     def write_memory(self, address: int, data: bytes, access: str = "ANY") -> None:
         _RECORDER.add(self.endpoint, f"(fake-write) @0x{address:X} len={len(data)}")
 
+    def search_variables(self, pattern: str, limit: int = 200) -> list[dict]:
+        return [
+            {
+                "name": "g_sys_state",
+                "type": "struct SystemState",
+                "address": "D:0x20000000",
+                "size": 64,
+            },
+            {
+                "name": "g_ticks",
+                "type": "volatile uint32_t",
+                "address": "D:0x20000040",
+                "size": 4,
+            }
+        ]
+
+    def inspect_structure(self, name: str) -> dict:
+        return {
+            "ok": True,
+            "structure": {
+                "name": name,
+                "type": "struct SystemState",
+                "value": "",
+                "members": [
+                    {
+                        "name": "mode",
+                        "type": "int",
+                        "value": "1",
+                    },
+                    {
+                        "name": "config",
+                        "type": "struct Config",
+                        "value": "",
+                        "members": [
+                            {
+                                "name": "baudrate",
+                                "type": "uint32_t",
+                                "value": "115200",
+                            }
+                        ]
+                    }
+                ]
+            }
+        }
+
     # ---- AREA log -----------------------------------------------------------
 
     def read_area_log(self, area: str = "MCPLOG", lines: int | None = None) -> str:

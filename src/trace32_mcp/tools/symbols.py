@@ -53,3 +53,37 @@ def t32_var_view(args: dict) -> dict:
     # Fallback: Var.PRINT into AREA so we can capture
     res = client.run(f"Var.PRINT {p.name}").to_dict()
     return {"ok": res["ok"], "name": p.name, "result": res}
+
+
+class SearchVariablesInput(TargetSelector):
+    pattern: str = Field(description="Glob pattern for the global variable name (e.g. 'my_var*' or '*state*').")
+    limit: int = Field(default=200, ge=1, le=5000, description="Max output lines.")
+
+
+class InspectStructureInput(TargetSelector):
+    name: str = Field(description="Full name of the structure variable (e.g. 'my_struct_var').")
+
+
+def t32_search_variables(args: dict) -> dict:
+    """Search global variables matching a wildcard/glob pattern.
+
+    Uses sYmbol.ForEach and returns a structured list of names, types, addresses, and sizes.
+    """
+    p = SearchVariablesInput(**args)
+    _inst, client = resolve_target(p)
+    variables = client.search_variables(p.pattern, limit=p.limit)
+    if variables and isinstance(variables[0], dict) and "_error" in variables[0]:
+        return {"ok": False, "pattern": p.pattern, "error": variables[0]["_error"]}
+    return {"ok": True, "pattern": p.pattern, "count": len(variables), "variables": variables}
+
+
+def t32_inspect_structure(args: dict) -> dict:
+    """Inspect a complex structure and recursively dump all its members and their values.
+
+    Leverages WinPrint and Var.View formatting options to write structure data to a file
+    and reconstructs a JSON hierarchy.
+    """
+    p = InspectStructureInput(**args)
+    _inst, client = resolve_target(p)
+    return client.inspect_structure(p.name)
+

@@ -266,3 +266,69 @@ def test_recorder_captures_every_command(attached):
     t32_run_command({"node_name": attached, "line": "PRINT 2"})
     calls = recorder().all()
     assert [c.cmd for c in calls] == ["PRINT 1", "PRINT 2"]
+
+
+# --------- new variable tools -----------------------------------------------
+
+def test_search_variables(attached):
+    from trace32_mcp.tools.symbols import t32_search_variables
+    out = t32_search_variables({"node_name": attached, "pattern": "g_*"})
+    assert out["ok"]
+    assert out["count"] > 0
+    assert out["variables"][0]["name"] == "g_sys_state"
+
+
+def test_inspect_structure(attached):
+    from trace32_mcp.tools.symbols import t32_inspect_structure
+    out = t32_inspect_structure({"node_name": attached, "name": "my_struct"})
+    assert out["ok"]
+    assert "structure" in out
+    assert out["structure"]["name"] == "my_struct"
+    assert len(out["structure"]["members"]) > 0
+
+
+def test_parser_var_view():
+    from trace32_mcp.t32_client import T32Client, T32Endpoint
+    # We can instantiate a dummy client (we don't need to connect it to test private _parse_var_view)
+    client = T32Client(T32Endpoint("127.0.0.1", 20000))
+    
+    sample_output = """
+(struct SystemState) g_sys_state = (
+  (int) mode = 1
+  (volatile uint32_t) ticks = 5432
+  (struct Config) config = (
+    (char [16]) name = "target_device"
+    (uint32_t) baudrate = 115200
+  )
+  (int [3]) ports = (
+    [0] = 80
+    [1] = 443
+    [2] = 8080
+  )
+)
+"""
+    parsed = client._parse_var_view(sample_output)
+    assert parsed["name"] == "g_sys_state"
+    assert parsed["type"] == "struct SystemState"
+    assert len(parsed["members"]) == 4
+    
+    # Check mode
+    assert parsed["members"][0]["name"] == "mode"
+    assert parsed["members"][0]["type"] == "int"
+    assert parsed["members"][0]["value"] == "1"
+    
+    # Check config
+    assert parsed["members"][2]["name"] == "config"
+    assert parsed["members"][2]["type"] == "struct Config"
+    assert len(parsed["members"][2]["members"]) == 2
+    assert parsed["members"][2]["members"][1]["name"] == "baudrate"
+    assert parsed["members"][2]["members"][1]["value"] == "115200"
+    
+    # Check ports array
+    assert parsed["members"][3]["name"] == "ports"
+    assert parsed["members"][3]["type"] == "int [3]"
+    assert len(parsed["members"][3]["members"]) == 3
+    assert parsed["members"][3]["members"][1]["name"] == "[1]"
+    assert parsed["members"][3]["members"][1]["value"] == "443"
+
+
