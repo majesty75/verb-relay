@@ -18,6 +18,8 @@ venv/
 # Build artifacts
 build/
 dist/
+*.zip
+airgap_bundle/
 
 # Local config
 .env
