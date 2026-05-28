@@ -15,7 +15,7 @@
 #
 param(
     [switch]$FromSource,
-    [string]$WheelUrl = "https://github.com/majesty75/verb-relay/releases/download/v0.2.0/trace32_mcp-0.2.0-py3-none-any.whl"
+    [string]$WheelUrl = "https://github.com/majesty75/verb-relay/releases/download/v0.2.1/trace32_mcp-0.2.1-py3-none-any.whl"
 )
 $ErrorActionPreference = "Stop"
 $repo = Split-Path -Parent $PSScriptRoot
