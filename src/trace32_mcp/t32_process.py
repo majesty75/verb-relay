@@ -989,6 +989,36 @@ def _parse_rcl_port_from_config(config_path: str) -> int | None:
 
 def _find_running_t32_processes_windows() -> list[dict]:
     import subprocess
+    import json
+
+    # Try using PowerShell Get-CimInstance, as wmic is deprecated and disabled in modern Windows 11
+    try:
+        ps_cmd = [
+            "powershell",
+            "-NoProfile",
+            "-Command",
+            "Get-CimInstance Win32_Process -Filter \"name like 't32m%'\" | "
+            "Select-Object ProcessId, Name, ExecutablePath, CommandLine | ConvertTo-Json -Compress"
+        ]
+        out = subprocess.check_output(ps_cmd, stderr=subprocess.DEVNULL, text=True, timeout=3.0).strip()
+        if out:
+            data = json.loads(out)
+            items = data if isinstance(data, list) else [data]
+            mapped = []
+            for item in items:
+                pid = item.get("ProcessId")
+                if pid:
+                    mapped.append({
+                        "Id": int(pid),
+                        "Name": item.get("Name", ""),
+                        "Path": item.get("ExecutablePath", ""),
+                        "Cmd": item.get("CommandLine", "")
+                    })
+            return mapped
+    except Exception:
+        pass
+
+    # Fallback to the original wmic method
     cmd = [
         "wmic",
         "process",
