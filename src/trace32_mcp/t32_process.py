@@ -499,8 +499,8 @@ class T32Instance:
 
     def is_alive(self) -> bool:
         if not self.spawned_by_us:
-            # External T32 — just probe the port
-            return is_port_open(self.host, self.port, timeout=0.2)
+            # External T32 — probe the port using RCL handshake (supports both UDP and TCP)
+            return is_rcl_responsive(self.host, self.port, timeout_per_try=0.2)
         if self.pid <= 0:
             # Fake instance (pid==0) — never call os.kill which would target
             # the whole process group; just say "no kernel process".
@@ -534,6 +534,7 @@ class InstanceRegistry:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._by_node: dict[str, T32Instance] = {}
+        self._last_scan = 0.0
         atexit.register(self._cleanup_atexit)
 
     def register(self, inst: T32Instance) -> None:
@@ -556,6 +557,13 @@ class InstanceRegistry:
             return self._by_node.pop(node, None)
 
     def list(self) -> list[T32Instance]:
+        now = time.time()
+        if now - self._last_scan > 5.0:
+            self._last_scan = now
+            try:
+                detect_and_register_external_instances()
+            except Exception:
+                pass
         with self._lock:
             return list(self._by_node.values())
 
@@ -913,3 +921,267 @@ def connect_or_spawn(
         t32sys=t32sys,
         headless=headless,
     )
+
+
+def _parse_config_path_from_cmdline(cmdline: str) -> str | None:
+    if not cmdline:
+        return None
+    parts = []
+    current = []
+    in_quotes = False
+    quote_char = None
+    for char in cmdline:
+        if char in ('"', "'"):
+            if in_quotes and char == quote_char:
+                in_quotes = False
+                quote_char = None
+            elif not in_quotes:
+                in_quotes = True
+                quote_char = char
+            else:
+                current.append(char)
+        elif char == ' ' and not in_quotes:
+            if current:
+                parts.append("".join(current))
+                current = []
+        else:
+            current.append(char)
+    if current:
+        parts.append("".join(current))
+        
+    for i, part in enumerate(parts):
+        if part.lower() in ("-c", "/c") and i + 1 < len(parts):
+            return parts[i+1]
+    return None
+
+
+def _parse_rcl_port_from_config(config_path: str) -> int | None:
+    try:
+        with open(config_path, "r", encoding="utf-8", errors="ignore") as f:
+            lines = f.readlines()
+    except Exception:
+        return None
+        
+    in_rcl_section = False
+    port = None
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith(";"):
+            if in_rcl_section and port is not None:
+                return port
+            in_rcl_section = False
+            continue
+            
+        if line.upper().startswith("RCL="):
+            val = line.split("=", 1)[1].strip().upper()
+            if val in ("NETASSIST", "NETTCP"):
+                in_rcl_section = True
+        elif in_rcl_section and line.upper().startswith("PORT="):
+            try:
+                port = int(line.split("=", 1)[1].strip())
+            except Exception:
+                pass
+                
+    if in_rcl_section and port is not None:
+        return port
+    return None
+
+
+def _find_running_t32_processes_windows() -> list[dict]:
+    import subprocess
+    cmd = [
+        "wmic",
+        "process",
+        "where",
+        "name like 't32m%'",
+        "get",
+        "CommandLine,ExecutablePath,Name,ProcessId",
+        "/format:list"
+    ]
+    try:
+        out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, text=True, timeout=3.0)
+        results = []
+        current = {}
+        for line in out.splitlines():
+            line = line.strip()
+            if not line:
+                if current:
+                    results.append(current)
+                    current = {}
+                continue
+            if "=" in line:
+                k, v = line.split("=", 1)
+                current[k] = v
+        if current:
+            results.append(current)
+        mapped = []
+        for item in results:
+            pid = item.get("ProcessId")
+            if pid:
+                try:
+                    pid = int(pid)
+                except ValueError:
+                    continue
+                mapped.append({
+                    "Id": pid,
+                    "Name": item.get("Name", ""),
+                    "Path": item.get("ExecutablePath", ""),
+                    "Cmd": item.get("CommandLine", "")
+                })
+        if mapped:
+            return mapped
+    except Exception:
+        pass
+
+    # PowerShell fallback
+    cmd_ps = [
+        "powershell",
+        "-NoProfile",
+        "-Command",
+        "Get-CimInstance Win32_Process -Filter \"Name like 't32m%'\" | "
+        "Select-Object @{Name='Id';Expression={$_.ProcessId}}, Name, @{Name='Path';Expression={$_.ExecutablePath}}, @{Name='Cmd';Expression={$_.CommandLine}} | "
+        "ConvertTo-Json -Compress"
+    ]
+    try:
+        out = subprocess.check_output(cmd_ps, stderr=subprocess.DEVNULL, text=True, timeout=3.0)
+        if out.strip():
+            import json
+            data = json.loads(out)
+            if isinstance(data, dict):
+                return [data]
+            elif isinstance(data, list):
+                return data
+    except Exception:
+        pass
+        
+    return []
+
+
+def _find_running_t32_processes_linux() -> list[dict]:
+    import glob
+    results = []
+    for proc_dir in glob.glob("/proc/[0-9]*"):
+        try:
+            pid = int(Path(proc_dir).name)
+            exe_link = os.readlink(os.path.join(proc_dir, "exe"))
+            exe_name = os.path.basename(exe_link)
+            if exe_name.startswith("t32m"):
+                with open(os.path.join(proc_dir, "cmdline"), "rb") as f:
+                    cmdline_bytes = f.read()
+                parts = [p.decode("utf-8", errors="ignore") for p in cmdline_bytes.split(b"\x00") if p]
+                cmdline_str = " ".join(parts)
+                results.append({
+                    "Id": pid,
+                    "Name": exe_name,
+                    "Path": exe_link,
+                    "Cmd": cmdline_str
+                })
+        except Exception:
+            continue
+    return results
+
+
+def _find_running_t32_processes_macos() -> list[dict]:
+    import subprocess
+    results = []
+    try:
+        out = subprocess.check_output(["ps", "-ax", "-o", "pid,comm,args"], stderr=subprocess.DEVNULL, text=True)
+        for line in out.splitlines()[1:]:
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split(None, 2)
+            if len(parts) >= 2:
+                pid = int(parts[0])
+                comm = parts[1]
+                args = parts[2] if len(parts) > 2 else comm
+                exe_name = os.path.basename(comm)
+                if exe_name.startswith("t32m") or "t32m" in comm:
+                    results.append({
+                        "Id": pid,
+                        "Name": exe_name,
+                        "Path": comm,
+                        "Cmd": args
+                    })
+    except Exception:
+        pass
+    return results
+
+
+def detect_and_register_external_instances() -> None:
+    """Scan the host OS for running t32m* processes, parse their config, and
+    register any responsive instances that aren't already tracked.
+    """
+    from .t32_fake import is_fake_mode
+    if is_fake_mode():
+        return
+
+    sysname = platform.system()
+    processes = []
+    if sysname == "Windows":
+        processes = _find_running_t32_processes_windows()
+    elif sysname == "Linux":
+        processes = _find_running_t32_processes_linux()
+    elif sysname == "Darwin":
+        processes = _find_running_t32_processes_macos()
+        
+    for p in processes:
+        pid = p.get("Id")
+        if not pid:
+            continue
+            
+        # Check if already tracked by PID
+        already_tracked = False
+        with _REGISTRY._lock:
+            for inst in _REGISTRY._by_node.values():
+                if inst.pid == pid:
+                    already_tracked = True
+                    break
+        if already_tracked:
+            continue
+            
+        exe_path = p.get("Path")
+        cmd = p.get("Cmd")
+        
+        config_path = _parse_config_path_from_cmdline(cmd)
+        if not config_path and exe_path:
+            exe_dir = Path(exe_path).parent
+            for candidate_dir in (exe_dir, exe_dir.parent.parent):
+                candidate = candidate_dir / "config.t32"
+                if candidate.exists():
+                    config_path = str(candidate)
+                    break
+            
+            if not config_path:
+                candidate = Path("config.t32")
+                if candidate.exists():
+                    config_path = str(candidate.resolve())
+                    
+        if config_path:
+            port = _parse_rcl_port_from_config(config_path)
+            if port:
+                host = "127.0.0.1"
+                existing = _REGISTRY.get_by_endpoint(host, port)
+                if not existing:
+                    # Quick check if responsive before registering
+                    if is_rcl_responsive(host, port, timeout_per_try=0.2):
+                        exe_name = p.get("Name", "")
+                        arch = "unknown"
+                        for a in ARCH_BINARIES:
+                            if ARCH_BINARIES[a] in exe_name:
+                                arch = a
+                                break
+                        node = f"T32_auto_{port}"
+                        inst = T32Instance(
+                            node_name=node,
+                            host=host,
+                            port=port,
+                            arch=arch,
+                            pid=pid,
+                            binary=exe_path or "(external)",
+                            config_path=config_path,
+                            log_path="",
+                            work_dir="",
+                            spawned_by_us=False,
+                        )
+                        _REGISTRY.register(inst)

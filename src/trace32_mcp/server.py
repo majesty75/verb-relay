@@ -71,7 +71,7 @@ TOOLS: list[tuple[str, str, Callable[[dict], dict], Any]] = [
         "Fails if nothing is listening. Use t32_spawn instead to launch a new one.",
         sess.t32_attach, sess.AttachInput),
     ("t32_list_instances",
-        "List every TRACE32 instance currently tracked (spawned by us + attached external). "
+        "List every TRACE32 instance currently tracked (spawned by us, attached external, and auto-detected running instances). "
         "Includes node_name, endpoint, alive, uptime.",
         inst.t32_list_instances, inst.ListInstancesInput),
     ("t32_shutdown",
