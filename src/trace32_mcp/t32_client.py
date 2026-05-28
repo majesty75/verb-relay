@@ -513,47 +513,75 @@ class T32Client:
         return out
 
     def search_variables(self, pattern: str, limit: int = 200) -> list[dict]:
-        """Search global variables matching a pattern using sYmbol.ForEach."""
+        """Search global variables matching a pattern using sYmbol.ForEach.
+
+        Strategy: use sYmbol.ForEach with a simple PRINT to dump all matching
+        symbol names, then post-filter by querying sYmbol.TYPE() for each one
+        to keep only HLL variables (type==3).  The old approach tried to embed
+        an if-block inside the ForEach command string, which PRACTICE doesn't
+        support for single-line commands.
+        """
         with self._lock:
             self._ensure_connected()
             try:
                 self._dbg.cmd("AREA.CLEAR MCPLOG")
-                # We use sYmbol.ForEach to print matching variables to MCPLOG
-                # Double quotes inside quotes must be doubled for PRACTICE: ""
-                cmd = (
-                    f'sYmbol.ForEach '
-                    f'"if sYmbol.TYPE(*)==3 ( PRINT ""VAR:*:"", Var.TYPEOF(*), "":"", Var.ADDRESS(*), "":"", Var.SIZEOF(*) )" '
-                    f'{pattern}'
-                )
+                self._dbg.cmd("AREA.Select MCPLOG")
+                # Simple PRINT of the symbol name — no nested if, no quoting headaches
+                cmd = f'sYmbol.ForEach "PRINT ""SYM:*""" {pattern}'
                 self._dbg.cmd(cmd)
+                # sYmbol.ForEach runs as a PRACTICE script — wait for it to finish
+                import time as _time
+                for _ in range(100):
+                    try:
+                        pstate = int(self._dbg._get_practice_state())
+                    except Exception:
+                        pstate = 0
+                    if pstate == 0:
+                        break
+                    _time.sleep(0.05)
             except Exception as e:
                 return [{"_error": f"sYmbol.ForEach failed: {e}"}]
             txt = self._read_area_inline("MCPLOG")
 
-        # Parse MCPLOG lines starting with "VAR:"
-        out = []
+        # Collect all symbol names printed by ForEach
+        candidates: list[str] = []
         for line in txt.splitlines():
             line = line.strip()
-            if not line or not line.startswith("VAR:"):
-                continue
-            parts = line.split(":", 5)
-            if len(parts) >= 6:
-                name = parts[1]
-                vtype = parts[2]
-                addr = parts[3]
-                size_str = parts[4]
-                try:
-                    size = int(size_str.strip('.'))
-                except Exception:
-                    size = size_str
-                out.append({
-                    "name": name,
-                    "type": vtype,
-                    "address": addr,
-                    "size": size,
-                })
-            if len(out) >= limit:
+            if line.startswith("SYM:"):
+                name = line[4:].strip()
+                if name:
+                    candidates.append(name)
+            if len(candidates) >= limit * 5:  # grab extra, we filter below
                 break
+
+        # Post-filter: keep only HLL variables (sYmbol.TYPE == 3)
+        out: list[dict] = []
+        with self._lock:
+            self._ensure_connected()
+            for name in candidates:
+                try:
+                    sym_type = self._dbg.fnc(f"sYmbol.TYPE({name})")
+                    if sym_type != 3:
+                        continue
+                except Exception:
+                    continue
+                # Gather metadata
+                entry: dict = {"name": name}
+                try:
+                    entry["type"] = str(self._dbg.fnc(f"Var.TYPEOF({name})"))
+                except Exception:
+                    entry["type"] = ""
+                try:
+                    entry["address"] = hex(int(self._dbg.fnc(f"Var.ADDRESS({name})")))
+                except Exception:
+                    entry["address"] = ""
+                try:
+                    entry["size"] = int(self._dbg.fnc(f"Var.SIZEOF({name})"))
+                except Exception:
+                    entry["size"] = ""
+                out.append(entry)
+                if len(out) >= limit:
+                    break
         return out
 
     def inspect_structure(self, name: str) -> dict:
@@ -641,7 +669,7 @@ class T32Client:
 
         for line in lines:
             stripped = line.strip()
-            if not stripped or stripped.startswith(";"):
+            if not stripped or stripped.startswith(";") or stripped.startswith("B::"):
                 continue
 
             if stripped == ")":
@@ -664,6 +692,14 @@ class T32Client:
 
             type_str, name_str = extract_type_and_name(name_part)
 
+            # Strip trailing commas and handle closing parentheses in value_part
+            num_pops = 0
+            while value_part.endswith(")"):
+                value_part = value_part[:-1].strip()
+                num_pops += 1
+            if value_part.endswith(","):
+                value_part = value_part[:-1].strip()
+
             member = {
                 "name": name_str,
                 "type": type_str,
@@ -676,6 +712,10 @@ class T32Client:
 
             if is_container:
                 stack.append(member)
+
+            for _ in range(num_pops):
+                if len(stack) > 1:
+                    stack.pop()
 
         if root["members"]:
             return root["members"][0]
