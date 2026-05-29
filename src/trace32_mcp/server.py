@@ -148,8 +148,15 @@ TOOLS: list[tuple[str, str, Callable[[dict], dict], Any]] = [
         "Typed variable view (handles structs/arrays).",
         syms.t32_var_view, syms.VarViewInput),
     ("t32_search_variables",
-        "Search global variables matching a wildcard/glob pattern (e.g. 'my_var*' or '*state*').",
+        "Search global variables matching a wildcard/glob pattern (e.g. 'my_var*' or '*state*'). "
+        "Returns names + type/address/size only. Use t32_read_globals to also get values.",
         syms.t32_search_variables, syms.SearchVariablesInput),
+    ("t32_read_globals",
+        "Match global variables by wildcard (e.g. 'g_*', '*state*', or an exact name) and return "
+        "their VALUES in one call: name, type, address, size, and formatted value. Scalars are typed; "
+        "large structs/arrays are returned as a truncated formatted string. The fastest way to read "
+        "the value of one or many globals.",
+        syms.t32_read_globals, syms.ReadGlobalsInput),
     ("t32_inspect_structure",
         "Inspect a complex structure recursively and dump all its members, types, and values.",
         syms.t32_inspect_structure, syms.InspectStructureInput),

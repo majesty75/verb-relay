@@ -222,7 +222,33 @@ class FakeT32Client:
             }
         ]
 
-    def inspect_structure(self, name: str) -> dict:
+    def read_globals(self, pattern: str, *, max_vars: int = 100,
+                     max_value_len: int = 4000) -> dict:
+        return {
+            "ok": True,
+            "pattern": pattern,
+            "count": 2,
+            "variables": [
+                {
+                    "name": "g_ticks",
+                    "type": "volatile uint32_t",
+                    "address": "0x20000040",
+                    "size": 4,
+                    "scalar_value": 12345,
+                    "value": "12345",
+                },
+                {
+                    "name": "g_sys_state",
+                    "type": "struct SystemState",
+                    "address": "0x20000000",
+                    "size": 64,
+                    "value": "(mode = 1, config = (baudrate = 115200))",
+                },
+            ],
+        }
+
+    def inspect_structure(self, name: str, *, max_depth: int = 4,
+                          max_members: int = 50, max_bytes: int = 2_000_000) -> dict:
         return {
             "ok": True,
             "structure": {

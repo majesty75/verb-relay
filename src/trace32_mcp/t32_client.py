@@ -327,7 +327,10 @@ class T32Client:
         except FileNotFoundError:
             pass
         try:
-            self._dbg.cmd(f'AREA.SAVE "{tmp.as_posix()}" {area}')
+            # AREA.SAVE saves the SELECTED area and takes NO area-name argument
+            # (passing one raises "no more arguments expected"). Select first.
+            self._dbg.cmd(f"AREA.Select {area}")
+            self._dbg.cmd(f'AREA.SAVE "{tmp.as_posix()}"')
         except Exception:
             return ""
         for _ in range(20):
@@ -512,83 +515,321 @@ class T32Client:
                 break
         return out
 
-    def search_variables(self, pattern: str, limit: int = 200) -> list[dict]:
-        """Search global variables matching a pattern using sYmbol.ForEach.
+    def _enumerate_symbol_names(self, pattern: str, limit: int = 1000) -> tuple[list[str], str | None]:
+        """Return LEAF symbol names matching a TRACE32 wildcard via sYmbol.ForEach.
 
-        Strategy: use sYmbol.ForEach with a simple PRINT to dump all matching
-        symbol names, then post-filter by querying sYmbol.TYPE() for each one
-        to keep only HLL variables (type==3).  The old approach tried to embed
-        an if-block inside the ForEach command string, which PRACTICE doesn't
-        support for single-line commands.
+        `sYmbol.ForEach "<cmd>" <wildcard>` iterates every symbol matching the
+        wildcard and substitutes the FULLY-QUALIFIED name (e.g. `\\sieve\\func\\v`)
+        for `*` in <cmd>. We PRINT each with a marker and parse it back. Two
+        things learned the hard way on a real target:
+
+          * We capture from the DEFAULT message area A000 (where PRINT lands)
+            instead of juggling a private MCPLOG area — fewer commands, fewer
+            moving parts (the marker prefix lets us ignore A000's other noise).
+          * ForEach yields `\\`-qualified names. A leading backslash makes `fnc()`
+            treat the string as a PRACTICE macro, so EVERY downstream
+            Var.*/sYmbol.TYPE re-query failed and results came back empty. We
+            therefore return the LEAF (last `\\`-separated component), which
+            resolves cleanly in Var.VALUE/Var.STRing/sYmbol.TYPE.
+
+        Returns (leaf_names, error). Caller must NOT hold the lock.
         """
+        import tempfile, time as _time
+        from pathlib import Path as _P
+        marker = "T32SYM:"
+        tmp = _P(tempfile.gettempdir()) / f"trace32_mcp_enum_{self.endpoint.port}.txt"
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+
         with self._lock:
             self._ensure_connected()
             try:
-                self._dbg.cmd("AREA.CLEAR MCPLOG")
-                self._dbg.cmd("AREA.Select MCPLOG")
-                # Simple PRINT of the symbol name — no nested if, no quoting headaches
-                cmd = f'sYmbol.ForEach "PRINT ""SYM:*""" {pattern}'
-                self._dbg.cmd(cmd)
-                # sYmbol.ForEach runs as a PRACTICE script — wait for it to finish
-                import time as _time
-                for _ in range(100):
+                # Select the default area A000 so the ForEach PRINTs land there,
+                # then capture by saving the SELECTED area to a file. AREA.SAVE
+                # takes NO area-name argument — it saves whatever AREA.Select
+                # chose (passing a name raises "no more arguments expected").
+                self._dbg.cmd("AREA.Select A000")
+                self._dbg.cmd("AREA.CLEAR A000")
+                # Doubled "" → a literal " in the PRACTICE string; * is replaced
+                # by ForEach with the matched symbol's (qualified) name.
+                self._dbg.cmd(f'sYmbol.ForEach "PRINT ""{marker}*""" {pattern}')
+                # ForEach runs as a PRACTICE script — poll fast, bail when idle.
+                for _ in range(150):
                     try:
-                        pstate = int(self._dbg._get_practice_state())
+                        if int(self._dbg._get_practice_state()) == 0:
+                            break
                     except Exception:
-                        pstate = 0
-                    if pstate == 0:
                         break
-                    _time.sleep(0.05)
+                    _time.sleep(0.02)
+                self._dbg.cmd(f'AREA.SAVE "{tmp.as_posix()}"')
             except Exception as e:
-                return [{"_error": f"sYmbol.ForEach failed: {e}"}]
-            txt = self._read_area_inline("MCPLOG")
+                return [], f"sYmbol.ForEach failed: {e}"
 
-        # Collect all symbol names printed by ForEach
-        candidates: list[str] = []
-        for line in txt.splitlines():
-            line = line.strip()
-            if line.startswith("SYM:"):
-                name = line[4:].strip()
-                if name:
-                    candidates.append(name)
-            if len(candidates) >= limit * 5:  # grab extra, we filter below
+        for _ in range(20):
+            if tmp.exists():
                 break
+            _time.sleep(0.02)
+        try:
+            txt = tmp.read_text(errors="replace")
+        except Exception:
+            return [], "could not read enumeration capture file (shared FS?)"
+        finally:
+            try: tmp.unlink()
+            except OSError: pass
 
-        # Post-filter: keep only HLL variables (sYmbol.TYPE == 3)
+        names: list[str] = []
+        seen: set[str] = set()
+        for line in txt.splitlines():
+            idx = line.find(marker)
+            if idx == -1:
+                continue
+            # Everything after the marker is the symbol name (no spaces in T32
+            # symbol names). Globals come back bare ('varray'); locals come back
+            # `\\`-qualified ('\\sieve\\func10\\v1') — take the leaf either way.
+            raw = line[idx + len(marker):].strip().split()[0] if line[idx + len(marker):].strip() else ""
+            leaf = raw.replace("/", "\\").rsplit("\\", 1)[-1].strip()
+            if leaf and leaf not in seen:
+                seen.add(leaf)
+                names.append(leaf)
+            if len(names) >= limit:
+                break
+        return names, None
+
+    def _names_for_pattern(self, pattern: str, limit: int = 1000) -> tuple[list[str], str | None]:
+        """Names matching `pattern` — fast path for exact (non-wildcard) names.
+
+        A bare name (no * ? [) is taken verbatim: NO sYmbol.ForEach is issued, so
+        the common "read variable X" case costs zero PRACTICE commands (just
+        fnc() reads downstream) — important under the unlicensed-sim 50-command
+        cap — and returns instantly. Wildcards go through ForEach enumeration.
+        """
+        if not any(c in pattern for c in "*?["):
+            return [pattern], None
+        return self._enumerate_symbol_names(pattern, limit=limit)
+
+    def _symbol_type(self, name: str) -> int | None:
+        """Numeric symbol class via sYmbol.TYPE() (caller holds the lock).
+
+        0=not found, 1=plain label, 2=HLL function, 3=HLL variable.
+        Returns None if the function couldn't be evaluated.
+        """
+        try:
+            return int(self._dbg.fnc(f"sYmbol.TYPE({name})"))
+        except Exception:
+            return None
+
+    def _read_one_global(self, name: str, max_value_len: int = 4000) -> dict | None:
+        """Read one variable's type/address/size/value via Var.* functions.
+
+        Caller MUST hold self._lock. Returns None when `name` is not a readable
+        variable (so functions/labels matched by the wildcard get dropped).
+        Uses only well-established PRACTICE functions:
+          Var.TYPEOF / Var.SIZEOF / Var.ADDRESS / Var.VALUE / Var.STRing
+        Var.STRing gives the full formatted value for scalars AND aggregates
+        (structs/arrays/unions) in a single round-trip; we truncate it so a huge
+        struct can't blow up the response.
+        """
+        def _f(expr: str):
+            try:
+                return self._dbg.fnc(expr)
+            except Exception:
+                return None
+
+        # Keep only HLL variables (sYmbol.TYPE == 3); drops functions/labels.
+        if self._symbol_type(name) != 3:
+            return None
+
+        type_v = _f(f"Var.TYPEOF({name})")
+        value_v = _f(f"Var.STRing({name})")
+        entry: dict = {"name": name, "type": "" if type_v is None else str(type_v)}
+
+        addr_v = _f(f"Var.ADDRESS({name})")
+        if addr_v is not None:
+            try:
+                entry["address"] = hex(int(addr_v))
+            except Exception:
+                entry["address"] = str(addr_v)
+
+        size_v = _f(f"Var.SIZEOF({name})")
+        if size_v is not None:
+            try:
+                entry["size"] = int(size_v)
+            except Exception:
+                entry["size"] = size_v
+
+        # Numeric/typed value — only meaningful for scalars/enums/pointers.
+        # For arrays/structs/unions Var.VALUE() returns the base ADDRESS, which
+        # is misleading as a "value", so skip it for aggregates (use the
+        # formatted `value`, or t32_inspect_structure, for those).
+        type_str = entry["type"]
+        is_aggregate = ("[" in type_str) or ("struct" in type_str) or ("union" in type_str)
+        if not is_aggregate:
+            scalar_v = _f(f"Var.VALUE({name})")
+            if isinstance(scalar_v, (int, float, bool)):
+                entry["scalar_value"] = scalar_v
+
+        if value_v is not None:
+            s = str(value_v)
+            if len(s) > max_value_len:
+                entry["value"] = s[:max_value_len]
+                entry["value_truncated"] = True
+            else:
+                entry["value"] = s
+        # Arrays whose Var.STRing came back empty: point the caller at the tool
+        # that can actually expand them.
+        if is_aggregate and not entry.get("value"):
+            entry["note"] = "aggregate — use t32_inspect_structure for members/values"
+        return entry
+
+    def search_variables(self, pattern: str, limit: int = 200) -> list[dict]:
+        """Search global variables matching a wildcard — names + type/addr/size.
+
+        Enumerates via sYmbol.ForEach, then keeps only symbols that resolve as
+        readable variables (Var.TYPEOF succeeds). Functions/labels are dropped.
+        For values, use read_globals (or t32_inspect_structure for a tree).
+        """
+        names, err = self._names_for_pattern(pattern, limit=limit * 5)
+        if err:
+            return [{"_error": err}]
+
         out: list[dict] = []
         with self._lock:
             self._ensure_connected()
-            for name in candidates:
-                try:
-                    sym_type = self._dbg.fnc(f"sYmbol.TYPE({name})")
-                    if sym_type != 3:
-                        continue
-                except Exception:
-                    continue
-                # Gather metadata
-                entry: dict = {"name": name}
-                try:
-                    entry["type"] = str(self._dbg.fnc(f"Var.TYPEOF({name})"))
-                except Exception:
-                    entry["type"] = ""
-                try:
-                    entry["address"] = hex(int(self._dbg.fnc(f"Var.ADDRESS({name})")))
-                except Exception:
-                    entry["address"] = ""
-                try:
-                    entry["size"] = int(self._dbg.fnc(f"Var.SIZEOF({name})"))
-                except Exception:
-                    entry["size"] = ""
+            for name in names:
+                def _f(expr: str):
+                    try:
+                        return self._dbg.fnc(expr)
+                    except Exception:
+                        return None
+                if self._symbol_type(name) != 3:
+                    continue  # keep only HLL variables
+                entry: dict = {"name": name, "type": str(_f(f"Var.TYPEOF({name})") or "")}
+                addr_v = _f(f"Var.ADDRESS({name})")
+                if addr_v is not None:
+                    try:
+                        entry["address"] = hex(int(addr_v))
+                    except Exception:
+                        entry["address"] = str(addr_v)
+                size_v = _f(f"Var.SIZEOF({name})")
+                if size_v is not None:
+                    try:
+                        entry["size"] = int(size_v)
+                    except Exception:
+                        entry["size"] = size_v
                 out.append(entry)
                 if len(out) >= limit:
                     break
         return out
 
-    def inspect_structure(self, name: str) -> dict:
-        """Inspect a structure's members recursively by printing to a temporary file via WinPrint."""
+    def _resolve_variable_name(self, name: str) -> tuple[str | None, list[str]]:
+        """Resolve a possibly-partial variable name to an exact one.
+
+        This is what lets a caller inspect a variable WITHOUT knowing its full
+        name. Returns (resolved_name | None, candidates):
+          * exact name that resolves         → (name, [name])
+          * wildcard/substring → 1 variable  → (that_name, [that_name])
+          * wildcard/substring → many vars   → (None, [all matches])  (disambiguate)
+          * nothing matches                  → (None, [])
+        """
+        has_wild = any(c in name for c in "*?[")
+
+        # 1. Exact name first (cheap) — accept if it resolves to a variable.
+        if not has_wild:
+            with self._lock:
+                self._ensure_connected()
+                if self._symbol_type(name) == 3:
+                    return name, [name]
+
+        # 2. Treat the input as a pattern (wrap a bare substring in *...*).
+        pattern = name if has_wild else f"*{name}*"
+        names, err = self._enumerate_symbol_names(pattern, limit=200)
+        if err or not names:
+            return None, []
+
+        # Keep only HLL variables (sYmbol.TYPE == 3).
+        variables: list[str] = []
+        with self._lock:
+            self._ensure_connected()
+            for nm in names:
+                if self._symbol_type(nm) == 3:
+                    variables.append(nm)
+        if len(variables) == 1:
+            return variables[0], variables
+        return None, variables
+
+    def read_globals(self, pattern: str, *, max_vars: int = 100,
+                     max_value_len: int = 4000) -> dict:
+        """One-shot: match globals by wildcard and return their VALUES.
+
+        This is the tool-facing primitive behind t32_read_globals — give it a
+        glob like 'g_*' or '*state*' and it returns each matching variable's
+        name, type, address, size, and formatted value. Aggregate values
+        (structs/arrays) come back as a single formatted string, truncated to
+        `max_value_len` so a large structure cannot overflow the response.
+
+        NOTE: values flow through TRACE32's eval result (Var.STRing), which the
+        RCL link caps at a few KB — so a large struct/array value is necessarily
+        partial here. t32_inspect_structure uses an unlimited file-based dump and
+        is the right tool when you need the whole thing.
+        """
+        names, err = self._names_for_pattern(pattern, limit=max_vars * 5)
+        if err:
+            return {"ok": False, "pattern": pattern, "error": err}
+
+        out: list[dict] = []
+        with self._lock:
+            self._ensure_connected()
+            for name in names:
+                entry = self._read_one_global(name, max_value_len=max_value_len)
+                if entry is not None:
+                    out.append(entry)
+                if len(out) >= max_vars:
+                    break
+
+        result = {"ok": True, "pattern": pattern, "count": len(out), "variables": out}
+        if any(v.get("value_truncated") for v in out):
+            result["note"] = (
+                "Some values were truncated to max_value_len. For a bounded, "
+                "structured member tree of a large struct, call t32_inspect_structure "
+                "with max_depth/max_members."
+            )
+        return result
+
+    def inspect_structure(self, name: str, *, max_depth: int = 4,
+                          max_members: int = 50, max_bytes: int = 2_000_000) -> dict:
+        """Inspect a structure recursively → a JSON member tree, with bounds.
+
+        Dumps `Var.View` of the variable to a temp file via WinPrint, parses it
+        into a nested tree, then prunes to `max_depth` levels and `max_members`
+        children per node so a very large structure cannot overflow the
+        response. `max_bytes` caps how much of the dump file we read at all.
+        Truncations are flagged in-tree (`truncated`, `members_omitted`).
+        """
         import tempfile
         import time as _time
         from pathlib import Path as _P
+
+        # Resolve a partial/wildcard name to an exact one. This is how the
+        # caller can drill into a struct without knowing its full name.
+        resolved, candidates = self._resolve_variable_name(name)
+        if resolved is None:
+            if candidates:
+                return {
+                    "ok": False,
+                    "need_disambiguation": True,
+                    "query": name,
+                    "candidates": candidates[:50],
+                    "hint": "Several variables match. Re-call with the exact 'name' from candidates.",
+                }
+            return {
+                "ok": False,
+                "query": name,
+                "error": f"No variable matched '{name}'. "
+                         "Call t32_search_variables to browse names, or use a wildcard like '*name*'.",
+            }
+        name = resolved
 
         # Create a temp file path that both Python and TRACE32 can access
         tmp = _P(tempfile.gettempdir()) / f"trace32_mcp_struct_{self.endpoint.port}_{int(_time.time())}.txt"
@@ -602,19 +843,27 @@ class T32Client:
             try:
                 # Set printer file to temp file in ASCII format
                 self._dbg.cmd(f'PRinTer.FILE "{tmp.as_posix()}" ASCII')
-                # Redirect Var.View %type %m %r to printer (which writes to the file and closes it)
-                self._dbg.cmd(f'WinPrint.Var.View %type %m %r {name}')
+                # Redirect a fully-expanded, typed Var.View to the printer file.
+                # %TYPE  → prefix each element with its C type (parser relies on this)
+                # %Multiline → expand nested structs/arrays one element per line
+                # (the previous "%type %m %r" used invalid format params, so
+                #  Var.View only warned and produced an empty dump.)
+                self._dbg.cmd(f'WinPrint.Var.View %TYPE %Multiline {name}')
             except Exception as e:
                 return {"ok": False, "error": f"WinPrint command failed: {e}"}
 
-        # Wait for file to be written
+        # Wait for file to be written, reading at most max_bytes.
         content = ""
+        file_truncated = False
         for _ in range(30):
             if tmp.exists():
                 # Wait a tiny bit for write to complete
                 _time.sleep(0.05)
                 try:
-                    content = tmp.read_text(errors="replace")
+                    with tmp.open("r", errors="replace") as fh:
+                        content = fh.read(max_bytes)
+                        if fh.read(1):
+                            file_truncated = True
                     break
                 except Exception:
                     pass
@@ -631,9 +880,37 @@ class T32Client:
         # Parse content
         parsed = self._parse_var_view(content)
         if not parsed:
-            return {"ok": False, "error": "Failed to parse structure content.", "raw": content}
+            return {"ok": False, "error": "Failed to parse structure content.", "raw": content[:4000]}
 
-        return {"ok": True, "structure": parsed}
+        pruned = self._prune_tree(parsed, max_depth=max_depth, max_members=max_members)
+        result = {"ok": True, "structure": pruned}
+        if file_truncated:
+            result["note"] = (
+                f"Dump exceeded max_bytes ({max_bytes}); parsed a prefix only. "
+                "Inspect a specific sub-member by name for the full value."
+            )
+        return result
+
+    @staticmethod
+    def _prune_tree(node: dict, *, max_depth: int, max_members: int, _depth: int = 0) -> dict:
+        """Bound a parsed member tree to max_depth levels / max_members per node."""
+        members = node.get("members")
+        if members is None:
+            return node
+        out = {k: v for k, v in node.items() if k != "members"}
+        if _depth >= max_depth:
+            out["members_omitted"] = len(members)
+            out["truncated"] = "max_depth"
+            return out
+        kept = members[:max_members]
+        out["members"] = [
+            T32Client._prune_tree(m, max_depth=max_depth, max_members=max_members, _depth=_depth + 1)
+            for m in kept
+        ]
+        if len(members) > max_members:
+            out["members_omitted"] = len(members) - max_members
+            out["truncated"] = "max_members"
+        return out
 
     def _parse_var_view(self, text: str) -> dict:
         def extract_type_and_name(text: str) -> tuple[str, str]:

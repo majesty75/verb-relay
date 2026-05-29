@@ -56,12 +56,25 @@ def t32_var_view(args: dict) -> dict:
 
 
 class SearchVariablesInput(TargetSelector):
-    pattern: str = Field(description="Glob pattern for the global variable name (e.g. 'my_var*' or '*state*').")
+    pattern: str = Field(default="*", description="Glob pattern for the variable name (e.g. 'my_var*' or '*state*'). "
+                                                  "Default '*' lists ALL global variables (the symbol browser).")
     limit: int = Field(default=200, ge=1, le=5000, description="Max output lines.")
+
+
+class ReadGlobalsInput(TargetSelector):
+    pattern: str = Field(description="Glob/wildcard for the global variable name (e.g. 'g_*', '*state*', 'sys_cfg'). "
+                                     "Matches against symbol names; functions/labels are dropped.")
+    max_vars: int = Field(default=100, ge=1, le=2000, description="Max number of variables to return.")
+    max_value_len: int = Field(default=4000, ge=64, le=65536,
+                               description="Max characters of each formatted value (large structs/arrays are truncated and flagged).")
 
 
 class InspectStructureInput(TargetSelector):
     name: str = Field(description="Full name of the structure variable (e.g. 'my_struct_var').")
+    max_depth: int = Field(default=4, ge=1, le=32, description="Max nesting levels to expand (deeper members are summarised).")
+    max_members: int = Field(default=50, ge=1, le=2000, description="Max children kept per node (extras are counted, not listed).")
+    max_bytes: int = Field(default=2_000_000, ge=4096, le=50_000_000,
+                           description="Max bytes of the raw Var.View dump to read — guards against giant structures.")
 
 
 def t32_search_variables(args: dict) -> dict:
@@ -77,13 +90,30 @@ def t32_search_variables(args: dict) -> dict:
     return {"ok": True, "pattern": p.pattern, "count": len(variables), "variables": variables}
 
 
-def t32_inspect_structure(args: dict) -> dict:
-    """Inspect a complex structure and recursively dump all its members and their values.
+def t32_read_globals(args: dict) -> dict:
+    """Match global variables by wildcard and return their VALUES in one call.
 
-    Leverages WinPrint and Var.View formatting options to write structure data to a file
-    and reconstructs a JSON hierarchy.
+    This is the go-to tool for "what is the value of <var>?" when you have a
+    name or a pattern. Pass a glob like 'g_*' or '*state*' (or an exact name)
+    and get back each matching variable's name, type, address, size, and
+    formatted value. Scalars come back typed; structs/arrays come back as a
+    formatted string truncated to `max_value_len`. For a bounded, structured
+    member tree of one large struct, follow up with t32_inspect_structure.
+    """
+    p = ReadGlobalsInput(**args)
+    _inst, client = resolve_target(p)
+    return client.read_globals(p.pattern, max_vars=p.max_vars, max_value_len=p.max_value_len)
+
+
+def t32_inspect_structure(args: dict) -> dict:
+    """Inspect a complex structure and recursively dump its members and values.
+
+    Leverages WinPrint and Var.View formatting to write structure data to a file
+    and reconstructs a JSON hierarchy, bounded by max_depth/max_members/max_bytes
+    so a very large structure cannot overflow the response.
     """
     p = InspectStructureInput(**args)
     _inst, client = resolve_target(p)
-    return client.inspect_structure(p.name)
+    return client.inspect_structure(p.name, max_depth=p.max_depth,
+                                    max_members=p.max_members, max_bytes=p.max_bytes)
 
