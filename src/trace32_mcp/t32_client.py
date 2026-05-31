@@ -310,41 +310,57 @@ class T32Client:
                 practice_state=pstate, error=err,
             )
 
-    def _read_area_inline(self, area: str = "MCPLOG") -> str:
-        """Read the named AREA via AREA.SAVE → tempfile (caller holds the lock).
+    def _read_window_content(self, command: str, *, chunk: int = 524288) -> str:
+        """Read a TRACE32 window via the native socket API (no filesystem).
 
-        Only useful when MCP and TRACE32 share a filesystem. Returns "" if
-        no shared FS (remote PowerDebug).
+        Uses `_get_window_content(command, requested, offset, "ASCII")` to get
+        plain text output. Reads in `chunk`-byte slices until the window is
+        exhausted, so there is no 4096-char AREA truncation.
+
+        `_get_window_content` returns a (status_int, bytearray) tuple; index [1]
+        is the content. Caller must hold the lock.
+
+        Returns the decoded window text (stripped of the leading "B::command\r\n"
+        header line that TRACE32 prefixes), or "" on any error.
         """
-        import tempfile, time as _time
-        from pathlib import Path as _P
-        # Per-endpoint filename so concurrent reads across instances don't
-        # clobber each other on the host filesystem (the T32-side AREA is
-        # already per-instance, but the dump file we read back is on us).
-        tmp = _P(tempfile.gettempdir()) / f"trace32_mcp_area_{self.endpoint.port}_{area}.txt"
+        parts: list[bytes] = []
+        offset = 0
         try:
-            tmp.unlink()
-        except FileNotFoundError:
-            pass
-        try:
-            # AREA.SAVE saves the SELECTED area and takes NO area-name argument
-            # (passing one raises "no more arguments expected"). Select first.
-            self._dbg.cmd(f"AREA.Select {area}")
-            self._dbg.cmd(f'AREA.SAVE "{tmp.as_posix()}"')
+            while True:
+                result = self._dbg._get_window_content(command, chunk, offset, "ASCII")
+                # result is (status: int, data: bytearray)
+                raw = bytes(result[1]) if isinstance(result, tuple) else bytes(result)
+                if not raw:
+                    break
+                parts.append(raw)
+                if len(raw) < chunk:
+                    break  # last (possibly partial) chunk
+                offset += len(raw)
         except Exception:
             return ""
-        for _ in range(20):
-            if tmp.exists():
-                break
-            _time.sleep(0.025)
-        if not tmp.exists():
-            return ""
+        text = b"".join(parts).decode("latin-1", errors="replace")
+        # Strip the "B::<command>\r\n" header line TRACE32 always prepends
+        if text.startswith("B::"):
+            text = text.split("\r\n", 1)[-1] if "\r\n" in text else text
+        # Strip leading/trailing blank lines (AREA windows are pre-allocated with
+        # empty rows; content lives at the bottom of the buffer)
+        lines = text.splitlines()
+        # Remove leading blank lines, keep trailing content
+        while lines and not lines[0].strip():
+            lines.pop(0)
+        return "\n".join(lines)
+
+    def _read_area_inline(self, area: str = "MCPLOG") -> str:
+        """Read the named AREA via the native window-content socket API.
+
+        Replaces the old AREA.SAVE → tempfile approach; no filesystem
+        dependency and no 4096-char truncation limit. Caller must hold the lock.
+        """
         try:
-            txt = tmp.read_text(errors="replace")
-        finally:
-            try: tmp.unlink()
-            except OSError: pass
-        return txt
+            self._dbg.cmd(f"AREA.Select {area}")
+        except Exception:
+            return ""
+        return self._read_window_content(f"AREA {area}")
 
     # Back-compat aliases
     def cmd(self, line: str) -> CommandResult:
@@ -386,7 +402,11 @@ class T32Client:
             state_int = 0
             cpu = ""
             try:
-                state_int = int(self._dbg.get_state())
+                raw_state = self._dbg.get_state()
+                if isinstance(raw_state, (bytes, bytearray)):
+                    state_int = raw_state[0] if raw_state else 0
+                else:
+                    state_int = int(raw_state)
             except Exception:
                 pass
             state_map = {0: "down", 1: "halted_no_debugger", 2: "stopped", 3: "running"}
@@ -534,22 +554,15 @@ class T32Client:
 
         Returns (leaf_names, error). Caller must NOT hold the lock.
         """
-        import tempfile, time as _time
-        from pathlib import Path as _P
+        import time as _time
         marker = "T32SYM:"
-        tmp = _P(tempfile.gettempdir()) / f"trace32_mcp_enum_{self.endpoint.port}.txt"
-        try:
-            tmp.unlink()
-        except FileNotFoundError:
-            pass
 
         with self._lock:
             self._ensure_connected()
             try:
-                # Select the default area A000 so the ForEach PRINTs land there,
-                # then capture by saving the SELECTED area to a file. AREA.SAVE
-                # takes NO area-name argument — it saves whatever AREA.Select
-                # chose (passing a name raises "no more arguments expected").
+                # Select the default area A000 so the ForEach PRINTs land there.
+                # Read it back via the native window-content socket API so we are
+                # not subject to the 4096-char AREA.SAVE filesystem truncation.
                 self._dbg.cmd("AREA.Select A000")
                 self._dbg.cmd("AREA.CLEAR A000")
                 # Doubled "" → a literal " in the PRACTICE string; * is replaced
@@ -563,21 +576,10 @@ class T32Client:
                     except Exception:
                         break
                     _time.sleep(0.02)
-                self._dbg.cmd(f'AREA.SAVE "{tmp.as_posix()}"')
+                # Read A000 content directly over the socket — no tempfile needed.
+                txt = self._read_window_content("AREA A000")
             except Exception as e:
                 return [], f"sYmbol.ForEach failed: {e}"
-
-        for _ in range(20):
-            if tmp.exists():
-                break
-            _time.sleep(0.02)
-        try:
-            txt = tmp.read_text(errors="replace")
-        except Exception:
-            return [], "could not read enumeration capture file (shared FS?)"
-        finally:
-            try: tmp.unlink()
-            except OSError: pass
 
         names: list[str] = []
         seen: set[str] = set()
@@ -801,18 +803,13 @@ class T32Client:
                           max_members: int = 50, max_bytes: int = 2_000_000) -> dict:
         """Inspect a structure recursively → a JSON member tree, with bounds.
 
-        Dumps `Var.View` of the variable to a temp file via WinPrint, parses it
-        into a nested tree, then prunes to `max_depth` levels and `max_members`
-        children per node so a very large structure cannot overflow the
-        response. `max_bytes` caps how much of the dump file we read at all.
+        Opens a `Var.View` window in TRACE32 and reads its full content via
+        the native socket API (`_get_window_content`), which bypasses the 4096-
+        char AREA truncation. The text is parsed into a nested tree, pruned to
+        `max_depth` levels and `max_members` children per node.
         Truncations are flagged in-tree (`truncated`, `members_omitted`).
         """
-        import tempfile
-        import time as _time
-        from pathlib import Path as _P
-
-        # Resolve a partial/wildcard name to an exact one. This is how the
-        # caller can drill into a struct without knowing its full name.
+        # Resolve a partial/wildcard name to an exact one.
         resolved, candidates = self._resolve_variable_name(name)
         if resolved is None:
             if candidates:
@@ -831,51 +828,23 @@ class T32Client:
             }
         name = resolved
 
-        # Create a temp file path that both Python and TRACE32 can access
-        tmp = _P(tempfile.gettempdir()) / f"trace32_mcp_struct_{self.endpoint.port}_{int(_time.time())}.txt"
-        try:
-            tmp.unlink()
-        except FileNotFoundError:
-            pass
-
         with self._lock:
             self._ensure_connected()
-            try:
-                # Set printer file to temp file in ASCII format
-                self._dbg.cmd(f'PRinTer.FILE "{tmp.as_posix()}" ASCII')
-                # Redirect a fully-expanded, typed Var.View to the printer file.
-                # %TYPE  → prefix each element with its C type (parser relies on this)
-                # %Multiline → expand nested structs/arrays one element per line
-                # (the previous "%type %m %r" used invalid format params, so
-                #  Var.View only warned and produced an empty dump.)
-                self._dbg.cmd(f'WinPrint.Var.View %TYPE %Multiline {name}')
-            except Exception as e:
-                return {"ok": False, "error": f"WinPrint command failed: {e}"}
-
-        # Wait for file to be written, reading at most max_bytes.
-        content = ""
-        file_truncated = False
-        for _ in range(30):
-            if tmp.exists():
-                # Wait a tiny bit for write to complete
-                _time.sleep(0.05)
-                try:
-                    with tmp.open("r", errors="replace") as fh:
-                        content = fh.read(max_bytes)
-                        if fh.read(1):
-                            file_truncated = True
-                    break
-                except Exception:
-                    pass
-            _time.sleep(0.05)
-
-        try:
-            tmp.unlink()
-        except OSError:
-            pass
+            # Open a Var.View window then read it back via the native socket API.
+            # %TYPE    → prefix each element with its C type (parser relies on this)
+            # %Multiline → expand nested structs/arrays one element per line
+            # No PRinTer.FILE / temp file needed — _get_window_content bypasses
+            # the filesystem entirely and has no 4096-char limit.
+            win_cmd = f"Var.View %TYPE %Multiline {name}"
+            content = self._read_window_content(win_cmd, chunk=max_bytes)
 
         if not content:
-            return {"ok": False, "error": f"Structure {name} could not be inspected or file was empty."}
+            return {"ok": False, "error": f"Structure {name} could not be inspected (window returned empty)."}
+
+        # Hard-cap at max_bytes so a runaway struct can't flood the response.
+        content_truncated = len(content) >= max_bytes
+        if content_truncated:
+            content = content[:max_bytes]
 
         # Parse content
         parsed = self._parse_var_view(content)
@@ -884,9 +853,9 @@ class T32Client:
 
         pruned = self._prune_tree(parsed, max_depth=max_depth, max_members=max_members)
         result = {"ok": True, "structure": pruned}
-        if file_truncated:
+        if content_truncated:
             result["note"] = (
-                f"Dump exceeded max_bytes ({max_bytes}); parsed a prefix only. "
+                f"Content exceeded max_bytes ({max_bytes}); parsed a prefix only. "
                 "Inspect a specific sub-member by name for the full value."
             )
         return result
@@ -1053,43 +1022,19 @@ class T32Client:
     # ---- AREA log -----------------------------------------------------------
 
     def read_area_log(self, area: str = "MCPLOG", lines: int | None = None) -> str:
-        """Save the named AREA to a temp file on the T32 host and read it back.
+        """Read the named AREA log via the native socket API.
 
-        Only useful when the MCP and T32 share a filesystem (true for local
-        sim). For remote PowerDebug returns the path-style empty result and
-        the caller should fall back to per-command CommandResult.text.
+        Uses `_get_window_content` so there is no filesystem dependency and no
+        4096-char AREA.SAVE truncation limit. Works for both local simulators
+        and remote PowerDebug connections.
         """
-        import tempfile
-        import time as _time
-        from pathlib import Path as _P
-
-        # Per-endpoint filename so concurrent reads across instances don't
-        # clobber each other on the host filesystem (the T32-side AREA is
-        # already per-instance, but the dump file we read back is on us).
-        tmp = _P(tempfile.gettempdir()) / f"trace32_mcp_area_{self.endpoint.port}_{area}.txt"
-        try:
-            tmp.unlink()
-        except FileNotFoundError:
-            pass
-
         with self._lock:
             self._ensure_connected()
             try:
-                self._dbg.cmd(f'AREA.SAVE "{tmp}" {area}')
+                self._dbg.cmd(f"AREA.Select {area}")
             except Exception:
                 return ""
-
-        for _ in range(20):
-            if tmp.exists():
-                break
-            _time.sleep(0.05)
-        if not tmp.exists():
-            return ""
-        text = tmp.read_text(errors="replace")
-        try:
-            tmp.unlink()
-        except OSError:
-            pass
+            text = self._read_window_content(f"AREA {area}")
         if lines is not None:
             text = "\n".join(text.splitlines()[-lines:])
         return text

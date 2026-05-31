@@ -997,10 +997,10 @@ def _find_running_t32_processes_windows() -> list[dict]:
             "powershell",
             "-NoProfile",
             "-Command",
-            "Get-CimInstance Win32_Process -Filter \"name like 't32m%'\" | "
+            "Get-CimInstance Win32_Process -Filter 'name like ''t32m%''' | "
             "Select-Object ProcessId, Name, ExecutablePath, CommandLine | ConvertTo-Json -Compress"
         ]
-        out = subprocess.check_output(ps_cmd, stderr=subprocess.DEVNULL, text=True, timeout=3.0).strip()
+        out = subprocess.check_output(ps_cmd, stderr=subprocess.DEVNULL, text=True, timeout=8.0).strip()
         if out:
             data = json.loads(out)
             items = data if isinstance(data, list) else [data]
@@ -1073,7 +1073,7 @@ def _find_running_t32_processes_windows() -> list[dict]:
         "ConvertTo-Json -Compress"
     ]
     try:
-        out = subprocess.check_output(cmd_ps, stderr=subprocess.DEVNULL, text=True, timeout=3.0)
+        out = subprocess.check_output(cmd_ps, stderr=subprocess.DEVNULL, text=True, timeout=8.0)
         if out.strip():
             import json
             data = json.loads(out)

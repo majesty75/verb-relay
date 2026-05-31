@@ -50,6 +50,12 @@ def t32_screenshot(args: dict) -> dict:
         res = client.run(cmd, capture_area=False).to_dict()
     except Exception as e:
         return {"ok": False, "error": f"screenshot failed: {e}", "error_type": type(e).__name__}
+    finally:
+        # Close the printer file and reset destination to default
+        try:
+            client.run("PRinTer.FILE", capture_area=False)
+        except Exception:
+            pass
 
     encoded = None
     fmt = None
