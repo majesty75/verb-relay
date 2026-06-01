@@ -211,7 +211,7 @@ class T32Client:
         """Create our dedicated MCPLOG AREA so command output is always
         retrievable even if the user has no AREA window open."""
         for setup_cmd in (
-            "AREA.CREATE MCPLOG 200. 1000.",
+            "AREA.CREATE MCPLOG 10000. 1000.",
             "AREA.Select MCPLOG",
             "AREA.CLEAR MCPLOG",
         ):
@@ -219,6 +219,10 @@ class T32Client:
                 self._dbg.cmd(setup_cmd)
             except Exception:
                 pass
+        try:
+            self._dbg.cmd("AREA.Select A000")
+        except Exception:
+            pass
 
     def close(self) -> None:
         with self._lock:
@@ -355,12 +359,19 @@ class T32Client:
 
         Replaces the old AREA.SAVE → tempfile approach; no filesystem
         dependency and no 4096-char truncation limit. Caller must hold the lock.
+        Restores AREA.Select A000 afterward so user-visible output is unaffected.
         """
         try:
             self._dbg.cmd(f"AREA.Select {area}")
         except Exception:
             return ""
-        return self._read_window_content(f"AREA {area}")
+        try:
+            return self._read_window_content(f"AREA {area}")
+        finally:
+            try:
+                self._dbg.cmd("AREA.Select A000")
+            except Exception:
+                pass
 
     # Back-compat aliases
     def cmd(self, line: str) -> CommandResult:
@@ -1034,7 +1045,13 @@ class T32Client:
                 self._dbg.cmd(f"AREA.Select {area}")
             except Exception:
                 return ""
-            text = self._read_window_content(f"AREA {area}")
+            try:
+                text = self._read_window_content(f"AREA {area}")
+            finally:
+                try:
+                    self._dbg.cmd("AREA.Select A000")
+                except Exception:
+                    pass
         if lines is not None:
             text = "\n".join(text.splitlines()[-lines:])
         return text
