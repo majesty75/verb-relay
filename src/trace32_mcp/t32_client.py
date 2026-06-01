@@ -209,21 +209,17 @@ class T32Client:
 
     def _setup_area(self) -> None:
         """Create our dedicated MCPLOG AREA so command output is always
-        retrievable even if the user has no AREA window open."""
+        retrievable even if the user has no AREA window open.
+        Does NOT select MCPLOG permanently — selection is done transiently
+        inside run() and restored afterward via AREA.SELECTed()."""
         for setup_cmd in (
             "AREA.CREATE MCPLOG 10000. 1000.",
-            "AREA.Select MCPLOG",
             "AREA.CLEAR MCPLOG",
         ):
             try:
                 self._dbg.cmd(setup_cmd)
             except Exception:
                 pass
-        try:
-            self._dbg.cmd("AREA.Select A000")
-        except Exception:
-            pass
-
     def close(self) -> None:
         with self._lock:
             if self._dbg is not None:
@@ -261,9 +257,16 @@ class T32Client:
                     ok=False, cmd=line, text="", mode=0, mode_flags=[],
                     practice_state=0, error=f"connect failed: {e}",
                 )
-            # Clear AREA so output of THIS command isn't mixed with previous.
+            # Route output of THIS command to MCPLOG, then restore the
+            # previously selected area so user-visible output is unaffected.
+            prev_area: str | None = None
             if capture_area:
                 try:
+                    prev_area = str(self._dbg.fnc("AREA.SELECTed()")).strip() or None
+                except Exception:
+                    pass
+                try:
+                    self._dbg.cmd("AREA.Select MCPLOG")
                     self._dbg.cmd("AREA.CLEAR MCPLOG")
                 except Exception:
                     pass
@@ -300,6 +303,12 @@ class T32Client:
             if capture_area and err is None:
                 try:
                     area_text = self._read_area_inline("MCPLOG")
+                except Exception:
+                    pass
+            # Restore previously selected area.
+            if capture_area and prev_area and prev_area != "MCPLOG":
+                try:
+                    self._dbg.cmd(f"AREA.Select {prev_area}")
                 except Exception:
                     pass
             ok = (err is None) and (not (mode & ERROR_MASK)) and (pstate != PRACTICE_ERR)
@@ -359,19 +368,10 @@ class T32Client:
 
         Replaces the old AREA.SAVE → tempfile approach; no filesystem
         dependency and no 4096-char truncation limit. Caller must hold the lock.
-        Restores AREA.Select A000 afterward so user-visible output is unaffected.
+        Does NOT call AREA.Select — _get_window_content addresses windows by
+        their command string directly, so no selection is required.
         """
-        try:
-            self._dbg.cmd(f"AREA.Select {area}")
-        except Exception:
-            return ""
-        try:
-            return self._read_window_content(f"AREA {area}")
-        finally:
-            try:
-                self._dbg.cmd("AREA.Select A000")
-            except Exception:
-                pass
+        return self._read_window_content(f"AREA {area}")
 
     # Back-compat aliases
     def cmd(self, line: str) -> CommandResult:
@@ -1041,17 +1041,7 @@ class T32Client:
         """
         with self._lock:
             self._ensure_connected()
-            try:
-                self._dbg.cmd(f"AREA.Select {area}")
-            except Exception:
-                return ""
-            try:
-                text = self._read_window_content(f"AREA {area}")
-            finally:
-                try:
-                    self._dbg.cmd("AREA.Select A000")
-                except Exception:
-                    pass
+            text = self._read_window_content(f"AREA {area}")
         if lines is not None:
             text = "\n".join(text.splitlines()[-lines:])
         return text
