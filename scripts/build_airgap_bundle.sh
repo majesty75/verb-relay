@@ -20,7 +20,7 @@ cd "$repo"
 out="$repo/airgap_bundle"; wheelhouse="$out/wheelhouse"
 rm -rf "$out"; mkdir -p "$wheelhouse"
 FROM_SOURCE=0; [ "${1:-}" = "--from-source" ] && FROM_SOURCE=1
-WHEEL_URL="${WHEEL_URL:-https://github.com/majesty75/verb-relay/releases/download/v0.4.3/trace32_mcp-0.4.3-py3-none-any.whl}"
+WHEEL_URL="${WHEEL_URL:-https://github.com/majesty75/verb-relay/releases/download/v0.4.4/trace32_mcp-0.4.4-py3-none-any.whl}"
 
 if [ "$FROM_SOURCE" = "1" ]; then
   if [ ! -f src/trace32_mcp/model/model.onnx ]; then

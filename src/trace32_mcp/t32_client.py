@@ -528,7 +528,13 @@ class T32Client:
         """
         with self._lock:
             self._ensure_connected()
+            prev_area: str | None = None
             try:
+                prev_area = str(self._dbg.fnc("AREA.SELECTed()")).strip() or None
+            except Exception:
+                pass
+            try:
+                self._dbg.cmd("AREA.Select MCPLOG")
                 self._dbg.cmd("AREA.CLEAR MCPLOG")
                 # sYmbol.List is a window; for inline output use sYmbol.List.*
                 # Use Function listing which AREAs the names.
@@ -536,6 +542,11 @@ class T32Client:
             except Exception as e:
                 return [{"_error": f"sYmbol.List.Function failed: {e}"}]
             txt = self._read_area_inline("MCPLOG")
+            if prev_area and prev_area != "MCPLOG":
+                try:
+                    self._dbg.cmd(f"AREA.Select {prev_area}")
+                except Exception:
+                    pass
         # Best-effort line parse: each non-empty token-line is a candidate name.
         out = []
         for line in txt.splitlines():
@@ -573,6 +584,11 @@ class T32Client:
 
         with self._lock:
             self._ensure_connected()
+            prev_area: str | None = None
+            try:
+                prev_area = str(self._dbg.fnc("AREA.SELECTed()")).strip() or None
+            except Exception:
+                pass
             try:
                 # Select the default area A000 so the ForEach PRINTs land there.
                 # Read it back via the native window-content socket API so we are
@@ -594,6 +610,12 @@ class T32Client:
                 txt = self._read_window_content("AREA A000")
             except Exception as e:
                 return [], f"sYmbol.ForEach failed: {e}"
+            finally:
+                if prev_area and prev_area != "A000":
+                    try:
+                        self._dbg.cmd(f"AREA.Select {prev_area}")
+                    except Exception:
+                        pass
 
         names: list[str] = []
         seen: set[str] = set()
