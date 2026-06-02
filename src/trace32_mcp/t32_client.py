@@ -212,14 +212,17 @@ class T32Client:
         retrievable even if the user has no AREA window open.
         Does NOT select MCPLOG permanently — selection is done transiently
         inside run() and restored afterward via AREA.SELECTed()."""
-        for setup_cmd in (
-            "AREA.CREATE MCPLOG 10000. 1000.",
-            "AREA.CLEAR MCPLOG",
-        ):
+        # Try progressively smaller sizes in case the T32 build has a low cap.
+        for lines, cols in ((1000, 500), (500, 256), (200, 200)):
             try:
-                self._dbg.cmd(setup_cmd)
+                self._dbg.cmd(f"AREA.CREATE MCPLOG {lines}. {cols}.")
+                break
             except Exception:
-                pass
+                continue
+        try:
+            self._dbg.cmd("AREA.CLEAR MCPLOG")
+        except Exception:
+            pass
     def close(self) -> None:
         with self._lock:
             if self._dbg is not None:
